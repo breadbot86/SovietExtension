@@ -15,47 +15,97 @@
 #include <vector>
 
 #if defined(__aarch64__)
-// 私有 ABI 仅适用于 WeChat 269079 / arm64，UUID 580294a45af5310d9a9ac3639bee0a28。
-// 0x530330 的消息菜单调用点 → 0x950868 构建器；其他菜单调用不插入 +1。
-// 原生“转发”在 0x51bdac 复制相同的 model+0x120，作为消息来源的对照锚点。
+// 私有 ABI 按构建选择：269079（UUID 580294a45af5310d9a9ac3639bee0a28）与
+// 270102（UUID 3b7b6abb2c363e58a384cdef05a57aa5）。
+// 消息菜单调用点 → 构建器；其他菜单调用不插入 +1。
+// 269079: 调用点 0x530330 → 构建器 0x950868；原生“转发”在 0x51bdac 复制相同的 model+0x120。
+// 270102: 调用点 0x632cbc → 构建器 0xCBF7D0；model 消息源移到 +0x130，条目跨度 0x170→0x190，
+//         构建器内部 key 排序/分隔符位置已重排，950bac/950bcc 两个锚点不再适用（已从表中移除）。
 static bool YMMessageMenuInstalled = false;
 
+// 每个构建的运行时 ABI：函数入口 + 模型布局常量。
+struct YMMessageMenuABI {
+    uintptr_t snapshotCopyCtor;
+    uintptr_t snapshotDtor;
+    uintptr_t qstringUtf8;
+    uintptr_t qstringDtor;
+    uintptr_t itemCtor;
+    uintptr_t itemDtor;
+    uintptr_t connDtor;
+    uintptr_t actionsDtor;
+    uintptr_t callerGate;
+    uintptr_t msgDataVtable;
+    uintptr_t actionSetVisible;
+    uintptr_t menuSeparator;
+    uintptr_t widgetActions;
+    uintptr_t insertAction;
+    uintptr_t nativeItemAdd;
+    uintptr_t qtConnect;
+    uintptr_t signalMember;
+    uintptr_t actionDisable;
+    uintptr_t builder;
+    uintptr_t builderContinue;
+    uintptr_t modelSourceOffset;
+    uintptr_t entryStride;
+};
+
+static const YMMessageMenuABI &YMMessageMenuCurrentABI(void) {
+    static const YMMessageMenuABI k269079 = {
+        0x2e0e10, 0x2e1ff8, 0x61bddf4, 0xab660,
+        0x19e08c8, 0x19e08cc, 0x629d564, 0x857fbc,
+        0x530330, 0x8e20548, 0x5c916b8, 0x19dc280,
+        0x5cc1e08, 0x5cc1aec, 0x19dbd20, 0x9539b8,
+        0x5c91aa0, 0x5c915c4, 0x950868, 0x950878,
+        0x120, 0x170,
+    };
+    static const YMMessageMenuABI k270102 = {
+        0x381ed8, 0x3830d4, 0x6d89f08, 0xaa174,
+        0x1e80774, 0x1e80778, 0x6e69694, 0x6eadb0,
+        0x632cbc, 0x9d01eb8, 0x685bd08, 0x1e7bdfc,
+        0x688c448, 0x688c12c, 0x1e7b89c, 0xcc2504,
+        0x685c0f0, 0x685bc14, 0xcbf7d0, 0xcbf7e0,
+        0x130, 0x190,
+    };
+    NSString *build = [NSBundle mainBundle].infoDictionary[@"CFBundleVersion"];
+    return [build isEqualToString:@"270102"] ? k270102 : k269079;
+}
+
 YMMessageSnapshot::YMMessageSnapshot(uintptr_t source) {
-    ((void (*)(void *, uintptr_t))YMRuntimeAddress(0x2e0e10))(this, source);
+    ((void (*)(void *, uintptr_t))YMRuntimeAddress(YMMessageMenuCurrentABI().snapshotCopyCtor))(this, source);
 }
 YMMessageSnapshot::~YMMessageSnapshot() {
-    ((void (*)(void *))YMRuntimeAddress(0x2e1ff8))(this);
+    ((void (*)(void *))YMRuntimeAddress(YMMessageMenuCurrentABI().snapshotDtor))(this);
 }
 
 struct YMMessageMenuQString {
     // 该版本 QString 是 8 字节数据句柄；用微信自己的 UTF-8 构造和析构，不能伪造布局。
     uintptr_t data;
     explicit YMMessageMenuQString(const char *text)
-        : data(((uintptr_t (*)(const char *, int))YMRuntimeAddress(0x61bddf4))(text, (int)strlen(text))) {}
-    ~YMMessageMenuQString() { ((void (*)(void *))YMRuntimeAddress(0xab660))(this); }
+        : data(((uintptr_t (*)(const char *, int))YMRuntimeAddress(YMMessageMenuCurrentABI().qstringUtf8))(text, (int)strlen(text))) {}
+    ~YMMessageMenuQString() { ((void (*)(void *))YMRuntimeAddress(YMMessageMenuCurrentABI().qstringDtor))(this); }
 };
 
 struct YMMessageMenuItem {
     // 原生业务菜单项，不是 QAction；构造时复制标题和样式，插入成功后由菜单接管。
     alignas(16) uint8_t storage[0x3c0];
     YMMessageMenuItem(const YMMessageMenuQString &title, uintptr_t style) {
-        ((void (*)(void *, const void *, uintptr_t, uintptr_t))YMRuntimeAddress(0x19e08c8))(this, &title, style, 0);
+        ((void (*)(void *, const void *, uintptr_t, uintptr_t))YMRuntimeAddress(YMMessageMenuCurrentABI().itemCtor))(this, &title, style, 0);
     }
-    ~YMMessageMenuItem() { ((void (*)(void *))YMRuntimeAddress(0x19e08cc))(this); }
+    ~YMMessageMenuItem() { ((void (*)(void *))YMRuntimeAddress(YMMessageMenuCurrentABI().itemDtor))(this); }
 };
 
 struct YMMessageMenuConnection {
     uintptr_t data;
     // 非平凡析构保证 arm64 返回句柄走 x8；不可简化为 uintptr_t 返回值。
     // 释放此局部连接句柄不会断开信号，连接及捕获的消息快照由 Qt 管理。
-    ~YMMessageMenuConnection() { ((void (*)(void *))YMRuntimeAddress(0x629d564))(this); }
+    ~YMMessageMenuConnection() { ((void (*)(void *))YMRuntimeAddress(YMMessageMenuCurrentABI().connDtor))(this); }
 };
 
 struct YMMessageMenuActions {
     // QWidget::actions() 返回的 QList 句柄。数据头为 ref/alloc/begin/end，指针数组从 +16 开始。
     // begin 可能非零；取得的快照仅用于定位/核对顺序，重排通过原生 insertAction 完成。
     uintptr_t data;
-    ~YMMessageMenuActions() { ((void (*)(void *))YMRuntimeAddress(0x857fbc))(this); }
+    ~YMMessageMenuActions() { ((void (*)(void *))YMRuntimeAddress(YMMessageMenuCurrentABI().actionsDtor))(this); }
     uintptr_t at(int index) const {
         const auto *bounds = (const int32_t *)(data + 8);
         if (index < 0 || index >= bounds[1] - bounds[0]) return 0;
@@ -101,28 +151,30 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
     std::vector<int32_t> nativeKeys;
     std::vector<uintptr_t> priorActions;
     bool hideRevoke = false;
-    if (caller == YMRuntimeAddress(0x530330) && [NSThread isMainThread]) {
+    const YMMessageMenuABI &abi = YMMessageMenuCurrentABI();
+    if (caller == YMRuntimeAddress(abi.callerGate) && [NSThread isMainThread]) {
         try {
-            uintptr_t begin = 0, end = 0, vtable = 0;
+            uintptr_t begin = 0, end = 0, vtable =  0;
             memcpy(&begin, (void *)(model + 8), 8);
             memcpy(&end, (void *)(model + 16), 8);
-            const uintptr_t source = model + 0x120;
+            const uintptr_t source = model + abi.modelSourceOffset;
             memcpy(&vtable, (void *)source, 8);
             uint32_t type = 0;
             uint64_t identifier = 0;
             memcpy(&type, (void *)(source + 8), 4);
             memcpy(&identifier, (void *)(source + 0x90), 8);
-            const bool validEntries = begin && end > begin && end - begin <= 64 * 0x170 &&
-                (end - begin) % 0x170 == 0 && vtable == YMRuntimeAddress(0x8e20548);
+            const bool validEntries = begin && end > begin && end - begin <= 64 * abi.entryStride &&
+                (end - begin) % abi.entryStride == 0 && vtable == YMRuntimeAddress(abi.msgDataVtable);
             if (validEntries) {
                 hideRevoke = YMIsRetainedSelfMessage(source);
-                for (uintptr_t entry = begin; entry < end; entry += 0x170)
+                for (uintptr_t entry = begin; entry < end; entry += abi.entryStride)
                     nativeKeys.push_back(*(const int32_t *)entry);
             }
-            // 模型菜单条目跨度为 0x170；首项 +0x48 提供原生样式，消息快照位于 model+0x120。
+            // 模型菜单条目跨度按构建（269079=0x170 / 270102=0x190）；首项 +0x48 提供原生样式，
+            // 消息快照位于 model+0x120(269079)/+0x130(270102)。
             // +0x58 是按消息方向解析的原会话；文字/图片/视频/表情包/应用消息共用类型门控。
-            if (begin && end > begin && end - begin <= 64 * 0x170 && (end - begin) % 0x170 == 0 &&
-                vtable == YMRuntimeAddress(0x8e20548) && identifier &&
+            if (begin && end > begin && end - begin <= 64 * abi.entryStride && (end - begin) % abi.entryStride == 0 &&
+                vtable == YMRuntimeAddress(abi.msgDataVtable) && identifier &&
                 YMForwardSupportsMessageType(type)) {
                 const auto &nativeSession = *(const std::string *)(source + 0x58);
                 if (!nativeSession.empty() && nativeSession.size() <= 128) {
@@ -136,7 +188,7 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
                         // 原生entry首4字节为key：0xbbf=Finder，0xbc1=另存为，0xfa3=删除。
                         // 用key去重和定位，不依赖本地化标题。
                         bool hasFinder = false, hasSave = false;
-                        for (uintptr_t entry = begin; entry < end; entry += 0x170) {
+                        for (uintptr_t entry = begin; entry < end; entry += abi.entryStride) {
                             if (*(const uint32_t *)entry == 0xbbf) hasFinder = true;
                             if (*(const uint32_t *)entry == 0xbc1) hasSave = true;
                         }
@@ -163,10 +215,10 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
         }
     }
 
-    // 原构建器在 0x951128..0x951144 销毁模型条目，所以样式复制和消息快照必须提前完成。
+    // 原构建器在尾部销毁模型条目（269079: 0x951128..0x951144），所以样式复制和消息快照必须提前完成。
     // 返回后只使用自己构造的 item 和 callback，不能再读取 begin/end 指向的旧条目。
     if (!pending.empty() || hideRevoke) {
-        auto prior = ((YMMessageMenuActions (*)(uintptr_t))YMRuntimeAddress(0x5cc1e08))(menu);
+        auto prior = ((YMMessageMenuActions (*)(uintptr_t))YMRuntimeAddress(abi.widgetActions))(menu);
         for (int i = 0; uintptr_t action = prior.at(i); ++i) priorActions.push_back(action);
     }
     YMMessageMenuOriginalBuilder(model, menu, fillNames);
@@ -174,8 +226,8 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
     try {
         using GetActions = YMMessageMenuActions (*)(uintptr_t);
         using InsertAction = void (*)(uintptr_t, uintptr_t, uintptr_t);
-        auto original = ((GetActions)YMRuntimeAddress(0x5cc1e08))(menu);
-        // 9508e8/951268按有符号key排序，950bac..950bdc在key/1000递增时插分隔符。
+        auto original = ((GetActions)YMRuntimeAddress(abi.widgetActions))(menu);
+        // 构建器按有符号key排序，key/1000 递增时插分隔符。
         // 构建前只复制key；原条目已析构。数量或原有前缀不符时不猜测动作身份。
         // 映射失败或缺少锚点时追加到末尾；不把任意原生动作当成删除。
         std::sort(nativeKeys.begin(), nativeKeys.end());
@@ -199,7 +251,7 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
                 uintptr_t action = original.at((int)(priorActions.size() + i));
                 if (layout[i] == 0xbc1) save = action;
                 if (hideRevoke && (layout[i] == 4001 || layout[i] == 4002)) {
-                    ((void (*)(uintptr_t, bool))YMRuntimeAddress(0x5c916b8))(action, false);
+                    ((void (*)(uintptr_t, bool))YMRuntimeAddress(abi.actionSetVisible))(action, false);
                     continue;
                 }
                 // 原生4000组含撤回(4001/4002)、删除(4003)，取首项，不能只锚定删除。
@@ -208,35 +260,35 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
             }
         }
         auto separatorBefore = [&](uintptr_t before) {
-            auto current = ((GetActions)YMRuntimeAddress(0x5cc1e08))(menu);
+            auto current = ((GetActions)YMRuntimeAddress(abi.widgetActions))(menu);
             uintptr_t previous = 0;
             for (int i = 0; uintptr_t action = current.at(i); ++i) {
                 if (action == before) break;
                 previous = action;
             }
             if (!previous || std::find(separators.begin(), separators.end(), previous) != separators.end()) return;
-            ((void (*)(uintptr_t))YMRuntimeAddress(0x19dc280))(menu);
-            auto updated = ((GetActions)YMRuntimeAddress(0x5cc1e08))(menu);
+            ((void (*)(uintptr_t))YMRuntimeAddress(abi.menuSeparator))(menu);
+            auto updated = ((GetActions)YMRuntimeAddress(abi.widgetActions))(menu);
             if (uintptr_t separator = updated.last()) {
                 separators.push_back(separator);
-                if (before) ((InsertAction)YMRuntimeAddress(0x5cc1aec))(menu, before, separator);
+                if (before) ((InsertAction)YMRuntimeAddress(abi.insertAction))(menu, before, separator);
             }
         };
         // 媒体优先放在保存前；无保存时与+1依次放在红字组前，不拆散撤回/删除。
         std::stable_partition(pending.begin(), pending.end(), [](const Pending &entry) { return !entry.repeat; });
         for (auto &entry : pending) {
-            uintptr_t action = ((uintptr_t (*)(uintptr_t, void *))YMRuntimeAddress(0x19dbd20))(menu, entry.item.get());
+            uintptr_t action = ((uintptr_t (*)(uintptr_t, void *))YMRuntimeAddress(abi.nativeItemAdd))(menu, entry.item.get());
             if (!action) continue;
             entry.item.release(); // 业务项和QAction已由Qt接管。
             using Connect = YMMessageMenuConnection (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, std::function<void()> *, int);
-            auto connection = ((Connect)YMRuntimeAddress(0x9539b8))(
-                action, YMRuntimeAddress(0x5c91aa0), 0, action, &entry.callback, 1);
+            auto connection = ((Connect)YMRuntimeAddress(abi.qtConnect))(
+                action, YMRuntimeAddress(abi.signalMember), 0, action, &entry.callback, 1);
             if (!connection.data) {
-                ((void (*)(uintptr_t, bool))YMRuntimeAddress(0x5c915c4))(action, false);
+                ((void (*)(uintptr_t, bool))YMRuntimeAddress(abi.actionDisable))(action, false);
                 YMLog(@"[MessageMenu] native callback connection failed; action disabled");
             }
             const uintptr_t before = entry.repeat ? destructive : (save ? save : destructive);
-            if (before) ((InsertAction)YMRuntimeAddress(0x5cc1aec))(menu, before, action);
+            if (before) ((InsertAction)YMRuntimeAddress(abi.insertAction))(menu, before, action);
             if (entry.repeat) {
                 separatorBefore(action);
                 if (before) separatorBefore(before);
@@ -253,8 +305,10 @@ void YMInstallMessageMenuPatch(void) {
     // 先复用转发层的版本/Resources 镜像 UUID 校验，再核对菜单辅助函数和调用点指纹。
     // 微信升级后必须重新定位并验证，不能仅替换版本号或沿用 QAction/QString 的尺寸假设。
     if (!YMGetMediaForwardAddresses(&addresses)) return;
+    const YMMessageMenuABI &abi = YMMessageMenuCurrentABI();
     struct Entry { uintptr_t offset; uint8_t bytes[16]; };
-    static const Entry entries[] = {
+    // 269079：含 0x950bac/0x950bcc 两个分隔符锚点与 0x51b288/0x51b2e8 转发锚点。
+    static const Entry entries269079[] = {
         {0x5c916b8, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xe8, 0x03, 0x01, 0xaa}},
         {0x51b288, {0x48, 0xf4, 0x81, 0x52, 0xe8, 0x43, 0x00, 0xb9, 0x37, 0x50, 0x11, 0x95, 0x20, 0x15, 0x00, 0xb4}},
         {0x951268, {0x08, 0x00, 0x40, 0xb9, 0x29, 0x00, 0x40, 0xb9, 0x1f, 0x01, 0x09, 0x6b, 0xe0, 0xa7, 0x9f, 0x1a}},
@@ -279,15 +333,47 @@ void YMInstallMessageMenuPatch(void) {
         {0x5c91aa0, {0xff, 0xc3, 0x00, 0xd1, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91, 0xe8, 0x71, 0x01, 0xb0}},
         {0x5c915c4, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf4, 0x03, 0x01, 0xaa}},
     };
-    for (const auto &entry : entries) {
+    // 270102：构建器重排后 0x950bac/0x950bcc 无对应锚点（已移除）；其余入口指纹从新镜像读取。
+    static const Entry entries270102[] = {
+        {0x685bd08, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xe8, 0x03, 0x01, 0xaa}},
+        {0x61c058, {0x48, 0xf4, 0x81, 0x52, 0xe8, 0x43, 0x00, 0xb9, 0x6b, 0xe8, 0x19, 0x95, 0x60, 0x15, 0x00, 0xb4}},
+        {0xcc01ec, {0x08, 0x00, 0x40, 0xb9, 0x29, 0x00, 0x40, 0xb9, 0x1f, 0x01, 0x09, 0x6b, 0xe0, 0xa7, 0x9f, 0x1a}},
+        {0xcbf208, {0xf8, 0x23, 0x00, 0xb9, 0x20, 0x03, 0x7d, 0xb2, 0xe1, 0x03, 0x17, 0xaa, 0xc5, 0x06, 0x83, 0x95}},
+        {0x61c0bc, {0x68, 0xf4, 0x81, 0x52, 0xe8, 0x43, 0x00, 0xb9, 0x0a, 0x42, 0x1a, 0x95, 0xc0, 0x00, 0x00, 0xb4}},
+        {0x1e7bdfc, {0xff, 0xc3, 0x00, 0xd1, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91}},
+        {0x688c448, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x08, 0xaa}},
+        {0x688c12c, {0xff, 0x03, 0x02, 0xd1, 0xfa, 0x67, 0x03, 0xa9, 0xf8, 0x5f, 0x04, 0xa9, 0xf6, 0x57, 0x05, 0xa9}},
+        {0x6eadb0, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa}},
+        {0x632cbc, {0x60, 0x12, 0x40, 0xf9, 0xe8, 0x23, 0x00, 0x91, 0xe1, 0x65, 0x89, 0x95, 0xe0, 0x07, 0x40, 0xf9}},
+        {0xcbf7d0, {0xfc, 0x6f, 0xba, 0xa9, 0xfa, 0x67, 0x01, 0xa9, 0xf8, 0x5f, 0x02, 0xa9, 0xf6, 0x57, 0x03, 0xa9}},
+        {0x1e80774, {0x24, 0xff, 0xff, 0x17, 0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91}},
+        {0x1e80778, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa}},
+        {0x1e80404, {0xfc, 0x6f, 0xba, 0xa9, 0xfa, 0x67, 0x01, 0xa9, 0xf8, 0x5f, 0x02, 0xa9, 0xf6, 0x57, 0x03, 0xa9}},
+        {0x1e7b89c, {0xff, 0x43, 0x01, 0xd1, 0xf8, 0x5f, 0x01, 0xa9, 0xf6, 0x57, 0x02, 0xa9, 0xf4, 0x4f, 0x03, 0xa9}},
+        {0x6d89f08, {0xff, 0xc3, 0x00, 0xd1, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91}},
+        {0xaa174, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xe8, 0x03, 0x00, 0xaa}},
+        {0x381ed8, {0xf6, 0x57, 0xbd, 0xa9, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91}},
+        {0xcc2504, {0xff, 0x43, 0x02, 0xd1, 0xfa, 0x67, 0x04, 0xa9, 0xf8, 0x5f, 0x05, 0xa9, 0xf6, 0x57, 0x06, 0xa9}},
+        {0x6e69694, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa}},
+        {0x685c0f0, {0xff, 0xc3, 0x00, 0xd1, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91, 0x68, 0x89, 0x01, 0xd0}},
+        {0x685bc14, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf4, 0x03, 0x01, 0xaa}},
+        {0x3830d4, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa}},
+    };
+    NSString *build = [NSBundle mainBundle].infoDictionary[@"CFBundleVersion"];
+    const BOOL build270102 = [build isEqualToString:@"270102"];
+    const Entry *entries = build270102 ? entries270102 : entries269079;
+    const size_t entryCount = build270102 ? sizeof(entries270102) / sizeof(entries270102[0])
+                                          : sizeof(entries269079) / sizeof(entries269079[0]);
+    for (size_t index = 0; index < entryCount; index++) {
+        const auto &entry = entries[index];
         if (memcmp((void *)YMRuntimeAddress(entry.offset), entry.bytes, sizeof(entry.bytes)) != 0) {
             YMLog(@"[MessageMenu] ABI fingerprint mismatch at 0x%lx; skip", entry.offset);
             return;
         }
     }
     YMMessageMediaActions::validateABI();
-    YMMessageMenuBuilderContinue = YMRuntimeAddress(0x950878);
-    YMMessageMenuInstalled = YMPatchARM64AbsoluteJump(YMRuntimeAddress(0x950868), (uintptr_t)&YMMessageMenuBuilder, "message menu builder");
+    YMMessageMenuBuilderContinue = YMRuntimeAddress(abi.builderContinue);
+    YMMessageMenuInstalled = YMPatchARM64AbsoluteJump(YMRuntimeAddress(abi.builder), (uintptr_t)&YMMessageMenuBuilder, "message menu builder");
 }
 #else
 void YMInstallMessageMenuPatch(void) {}

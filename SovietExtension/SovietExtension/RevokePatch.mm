@@ -99,6 +99,8 @@ typedef enum {
 typedef enum {
     YMRevokeOriginCallsiteModeLegacy410 = 0,
     YMRevokeOriginCallsiteModeV411      = 1,
+    // 270102：被覆盖的 4 条指令与 4.1.10 同形，但 ldr 的栈偏移为 0x308。
+    YMRevokeOriginCallsiteModeV270102   = 2,
 } YMRevokeOriginCallsiteMode;
 
 #pragma mark - MessageWrap 字段布局
@@ -421,7 +423,71 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         },
     },
 
-    
+    {
+        // 4.1.15 (270102) arm64。撤回协程相对 269079 已重写：
+        // RevokeOrigin callsite 与 SelfRevoke 的指令级补丁点本版不适配，
+        // 使用 InlineEntry 入口模式保证基础防撤回 + 灰色提示稳定生效。
+        // Wrap 结构 0x268→0x278，但插件读取的字段(+0x18/+0x30/+0xf8/+0x100/+0x114/+0x130/+0x148)
+        // 都在 0x188 插入点之前，布局字段无需调整。
+        .displayName = "Mac WeChat 4.1.15 arm64 / 270102",
+
+        .bundleID = "com.tencent.xinWeChat",
+        .shortVersion = "4.1.15",
+        .buildVersion = "270102",
+
+        .hookMode = YMRevokeHookModeInline,
+        .hookPointerVA = 0x30C576C, // ym_HandleSysMsg_RevokeMsg 入口（wrapper，模板拷贝→fromRaw→处理→析构）
+
+        .rawMessageTemplateVA = 0x87203F0, // wrapper 内 adrp 指向的 0xAA 模板，大小 0x278
+        .messageWrapFromRawVA = 0x4B62364,
+        .messageWrapDestructVA = 0xAA4760,
+
+        .insertPaySysMsgToSessionVA = 0x42E716C,
+        .YMMultiOpenTryPreventMultiInstanceVA = 0x26D5E8,
+        .YMGetMainWeixinProcessCountVA = 0,
+
+        .groupExitDBApplyVA = 0x2A30E40,
+        .groupExitFMessagePreVA = 0x2D60C8C,
+        .groupExitUpdateSessionCacheVA = 0x41F42C8,
+        .groupExitMemberDataListVA = 0x28C8764,
+        .groupExitChatroomInfoOperatorVA = 0x28EB3BC,
+
+        // 0x3418394 = 新协程 0x34177C0 内“查询原消息后”的检查点（与旧 0x2BBB1A8 逐指令对齐）：
+        //   ldr x22,[sp,#0x308]; cbz x22,+0x30; add x8,x22,#8; mov x9,#-1
+        // 查询调用 bl 0x3096B90（旧 0x285ED24），outWrap=SP+0x38（旧 0x18），
+        // 上下文对象 ext=SP+0x2F0（旧 0x2C0，svrId/session 字段 +0x60）。
+        .revokeOriginCallsiteAfterQueryVA = 0x3418394,
+        .revokeOriginCallsiteContinueVA = 0x34183A4,
+        .revokeOriginCallsiteZeroBranchVA = 0x34183C4,
+        .revokeOriginCallsiteCheckVA = 0,
+        .revokeOriginCallsiteMode = YMRevokeOriginCallsiteModeV270102,
+        .revokeOriginOutWrapStackOffset = 0x38,
+        .revokeOriginExtObjectStackOffset = 0x2F0,
+
+        .revokeDeleteMessagesVA = 0x309252C,
+
+        .openURLWebViewKindVA = 0x21BC064,
+
+        .sendMsgCGIVA = 0,
+        .roomNameQueryVA = 0x41F14C8,
+        // 顺序：MessageWrap 转换、MessageData 析构、单条转发并订阅、插入目标账号。
+        // 新版 MessageData 为 0x350，无独立默认构造（构造走拷贝构造 0x381ED8 + 清零源，
+        // 见 YMMessageDataConstructorRuntimeAddress）。
+        .mediaForward = {0x4B654C0, 0x3830D4, 0x1812DDC, 0x175E348},
+
+        .layout = {
+            .messageWrapSize = 632, // 0x278：新版在 +0x188..+0x1F8 间插入 16 字节
+
+            .remoteUserOrSessionOffset = 24,
+            .selfUserOffset = 48,
+
+            .createTimeMsOffset = 256,
+            .createTimeSecOffset = 276,
+
+            .contentOffset = 328,
+        },
+    },
+
     /*
      新版适配示例代码:
 
@@ -891,7 +957,8 @@ static const YMWeChatAdaptProfile *YMGetActiveProfile(void) {
 
 static BOOL YMShouldInstallRevokeHooks(void) {
     const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
-    return (profile && strcmp(profile->buildVersion, "269079") == 0) || YMIsAntiRevokeEnabled();
+    return (profile && (strcmp(profile->buildVersion, "269079") == 0 ||
+                        strcmp(profile->buildVersion, "270102") == 0)) || YMIsAntiRevokeEnabled();
 }
 
 #pragma mark - 地址辅助
@@ -916,16 +983,13 @@ uintptr_t YMSendMsgCGIRuntimeAddress(void) {
     return YMRuntimeAddress(profile->sendMsgCGIVA);
 }
 
-static BOOL YMMatchesWeChat269079Dylib(void) {
-    // 私有 ABI 只适用于已分析的 arm64 样本；版本号相同也可能有不同二进制。
+// 已分析样本的 wechat.dylib arm64 UUID。私有 ABI 只适用于列出的二进制；
+// 版本号相同也可能有不同二进制，所以逐字节比对 UUID。
+static BOOL YMMatchesAnalyzedDylibUUID(const uint8_t expectedUUID[16]) {
     struct mach_header_64 header = {};
     if (!YMSafeReadMemory(YMWeChatDylibSlide, &header, sizeof(header)) ||
         header.magic != MH_MAGIC_64 || header.cputype != CPU_TYPE_ARM64 ||
         header.sizeofcmds > 1024 * 1024) return NO;
-    static const uint8_t expectedUUID[16] = {
-        0x58, 0x02, 0x94, 0xa4, 0x5a, 0xf5, 0x31, 0x0d,
-        0x9a, 0x9a, 0xc3, 0x63, 0x9b, 0xee, 0x0a, 0x28
-    };
     BOOL matchesUUID = NO;
     size_t offset = sizeof(header);
     size_t end = offset + header.sizeofcmds;
@@ -945,6 +1009,21 @@ static BOOL YMMatchesWeChat269079Dylib(void) {
     return matchesUUID;
 }
 
+static BOOL YMMatchesWeChat269079Dylib(void) {
+    // 269079 / 4.1.11.23 arm64
+    static const uint8_t expectedUUID269079[16] = {
+        0x58, 0x02, 0x94, 0xa4, 0x5a, 0xf5, 0x31, 0x0d,
+        0x9a, 0x9a, 0xc3, 0x63, 0x9b, 0xee, 0x0a, 0x28
+    };
+    // 270102 / 4.1.15 arm64
+    static const uint8_t expectedUUID270102[16] = {
+        0x3b, 0x7b, 0x6a, 0xbb, 0x2c, 0x36, 0x3e, 0x58,
+        0xa3, 0x84, 0xcd, 0xef, 0x05, 0xa5, 0x7a, 0xa5
+    };
+    return YMMatchesAnalyzedDylibUUID(expectedUUID269079) ||
+           YMMatchesAnalyzedDylibUUID(expectedUUID270102);
+}
+
 BOOL YMGetMediaForwardAddresses(YMMediaForwardAddresses *addresses) {
     if (!addresses) return NO;
     *addresses = {};
@@ -953,12 +1032,22 @@ BOOL YMGetMediaForwardAddresses(YMMediaForwardAddresses *addresses) {
         !YMMatchesWeChat269079Dylib()) return NO;
 
     // 顺序对应转换、析构、单条转发、目标插入；入口被其他 Hook 改写时也拒绝调用。
-    static const uint8_t entryBytes[4][16] = {
+    static const uint8_t entryBytes269079[4][16] = {
         {0xff, 0xc3, 0x01, 0xd1, 0xf8, 0x5f, 0x03, 0xa9, 0xf6, 0x57, 0x04, 0xa9, 0xf4, 0x4f, 0x05, 0xa9},
         {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa},
         {0xff, 0x43, 0x06, 0xd1, 0xfc, 0x6f, 0x13, 0xa9, 0xfa, 0x67, 0x14, 0xa9, 0xf8, 0x5f, 0x15, 0xa9},
         {0xff, 0x83, 0x01, 0xd1, 0xf8, 0x5f, 0x02, 0xa9, 0xf6, 0x57, 0x03, 0xa9, 0xf4, 0x4f, 0x04, 0xa9}
     };
+    static const uint8_t entryBytes270102[4][16] = {
+        {0xff, 0xc3, 0x01, 0xd1, 0xf8, 0x5f, 0x03, 0xa9, 0xf6, 0x57, 0x04, 0xa9, 0xf4, 0x4f, 0x05, 0xa9},
+        {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa},
+        {0xff, 0x43, 0x06, 0xd1, 0xfc, 0x6f, 0x13, 0xa9, 0xfa, 0x67, 0x14, 0xa9, 0xf8, 0x5f, 0x15, 0xa9},
+        {0xff, 0x83, 0x01, 0xd1, 0xf8, 0x5f, 0x02, 0xa9, 0xf6, 0x57, 0x03, 0xa9, 0xf4, 0x4f, 0x04, 0xa9}
+    };
+    const uint8_t (*entryBytes)[16] = entryBytes269079;
+    if (strcmp(profile->buildVersion, "270102") == 0) {
+        entryBytes = entryBytes270102;
+    }
     uintptr_t runtime[4] = {
         YMRuntimeAddress(profile->mediaForward.fromWrap),
         YMRuntimeAddress(profile->mediaForward.destruct),
@@ -974,9 +1063,33 @@ BOOL YMGetMediaForwardAddresses(YMMediaForwardAddresses *addresses) {
     return YES;
 }
 
+// 270102 没有独立的 MessageData 默认构造（全部内联）；用「清零缓冲 + 原生拷贝构造」
+// 等效默认构造：拷贝构造会按字段处理清零源（空 string/shared_ptr/容器），再写入 vtable。
+static uintptr_t YMMessageDataCopyCtorRuntimeAddress270102(void) {
+    const uintptr_t runtime = YMRuntimeAddress(0x381ED8);
+    static const uint8_t expected[16] = {
+        0xf6, 0x57, 0xbd, 0xa9, 0xf4, 0x4f, 0x01, 0xa9,
+        0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91
+    };
+    uint8_t actual[16] = {};
+    if (!runtime || !YMSafeReadMemory(runtime, actual, sizeof(actual)) ||
+        memcmp(actual, expected, sizeof(actual)) != 0) return 0;
+    return runtime;
+}
+
+// 270102 专用：以「清零 0x350 + 原生拷贝构造」等效默认构造 MessageData。
+BOOL YMMessageDataConstructViaCopyCtor270102(void *data);
+
 uintptr_t YMMessageDataConstructorRuntimeAddress(void) {
     YMMediaForwardAddresses addresses = {};
     if (!YMGetMediaForwardAddresses(&addresses)) return 0;
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (profile && strcmp(profile->buildVersion, "270102") == 0) {
+        // 270102 无独立默认构造：返回插件侧 shim（清零 + 原生拷贝构造）。
+        // 入口校验失败只禁用生成通知，不影响已有消息的 +1 与媒体转发。
+        return YMMessageDataCopyCtorRuntimeAddress270102() ?
+            (uintptr_t)&YMMessageDataConstructViaCopyCtor270102 : 0;
+    }
     // 269079 的 MessageData 默认构造器，原生初始化所有 string、shared_ptr 和容器。
     // 独立校验：构造器不匹配只禁用生成通知，不影响已有消息的 +1 与媒体转发。
     const uintptr_t runtime = YMRuntimeAddress(0x48e0f90);
@@ -988,6 +1101,17 @@ uintptr_t YMMessageDataConstructorRuntimeAddress(void) {
     if (!runtime || !YMSafeReadMemory(runtime, actual, sizeof(actual)) ||
         memcmp(actual, expected, sizeof(actual)) != 0) return 0;
     return runtime;
+}
+
+// 270102 专用：以「清零 0x350 + 拷贝构造(this, 清零源)」等效默认构造 MessageData。
+// 拷贝构造按字段处理清零源（空 string / 空 shared_ptr / 空容器），并写入 vtable。
+BOOL YMMessageDataConstructViaCopyCtor270102(void *data) {
+    if (!data) return NO;
+    uintptr_t copyCtor = YMMessageDataCopyCtorRuntimeAddress270102();
+    if (!copyCtor) return NO;
+    memset(data, 0, 0x350);
+    ((void (*)(void *, const void *))copyCtor)(data, data);
+    return YES;
 }
 
 static inline void *YMRuntimePointer(uintptr_t staticVA) {
@@ -1297,7 +1421,7 @@ static NSString *YMBuildAntiRevokeNoticeText(NSString *remoteUserOrSession,
     }
 
     /*
-     这里不显示“原消息类型/内容”。
+     这里不显示"原消息类型/内容"。
      原消息本身已经因为当前 hook 被保留下来；如果要额外展示类型和内容，
      后续需要换到 CoReplaceOriginMessageByRevoke 并安全自查 MessageWrap，不能再 hook 全局 copy 函数。
      */
@@ -1701,7 +1825,8 @@ static BOOL YMInsertLocalAntiRevokeNotice(int64_t rawRevokeMessage) {
     */
     const size_t wrapSize = profile->layout.messageWrapSize;
 
-    alignas(16) uint8_t rawWrap[616];
+    // 269079 的 Wrap 为 616(0x268)，270102 为 632(0x278)；按最大版本预留。
+    alignas(16) uint8_t rawWrap[632];
     memset(rawWrap, 0, sizeof(rawWrap));
 
     if (wrapSize > sizeof(rawWrap)) {
@@ -2029,8 +2154,12 @@ static NSString *YMReadCachedMemberName(NSString *memberID, NSString *roomID, NS
 
 static NSString *YMQueryCachedMemberName(NSString *memberID, NSString *roomID, NSString *capturedGroupName) {
     if (!YMWeChatDylibSlide || !YMMatchesWeChat269079Dylib()) return @"";
-    static const uintptr_t addresses[] = {0x428E5D4, 0x1E58634, 0x39EFD50, 0x47B8684, 0x39F34B8, 0x2167A5C};
-    static const uint8_t entries[6][16] = {
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    const BOOL build270102 = profile && strcmp(profile->buildVersion, "270102") == 0;
+    // 顺序：服务 getter、注册表、缓存构造、会话查询、会话表、成员表。
+    static const uintptr_t addresses269079[] = {0x428E5D4, 0x1E58634, 0x39EFD50, 0x47B8684, 0x39F34B8, 0x2167A5C};
+    static const uintptr_t addresses270102[] = {0x451A950, 0x237ED18, 0x43B2500, 0x4AC9D88, 0x43B5ED4, 0x28FA314};
+    static const uint8_t entries269079[6][16] = {
         {0xff,0xc3,0x00,0xd1,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91},
         {0xff,0x03,0x01,0xd1,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9,0xfd,0xc3,0x00,0x91},
         {0xff,0x03,0x01,0xd1,0xf6,0x57,0x01,0xa9,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9},
@@ -2038,17 +2167,34 @@ static NSString *YMQueryCachedMemberName(NSString *memberID, NSString *roomID, N
         {0xf6,0x57,0xbd,0xa9,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91},
         {0xff,0x03,0x01,0xd1,0xf6,0x57,0x01,0xa9,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9}
     };
+    static const uint8_t entries270102[6][16] = {
+        {0xff,0xc3,0x00,0xd1,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91},
+        {0xff,0x03,0x01,0xd1,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9,0xfd,0xc3,0x00,0x91},
+        {0xff,0x03,0x01,0xd1,0xf6,0x57,0x01,0xa9,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9},
+        {0x00,0x80,0x01,0x91,0xa3,0xdf,0xfc,0x17,0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9},
+        {0xf6,0x57,0xbd,0xa9,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91},
+        {0xff,0x03,0x01,0xd1,0xf6,0x57,0x01,0xa9,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9}
+    };
+    const uintptr_t *addresses = build270102 ? addresses270102 : addresses269079;
+    const uint8_t (*entries)[16] = build270102 ? entries270102 : entries269079;
     uintptr_t functions[6] = {};
     for (size_t i = 0; i < 6; ++i) {
         functions[i] = YMRuntimeAddress(addresses[i]);
         uint8_t bytes[16];
         if (!YMSafeReadMemory(functions[i], bytes, sizeof(bytes)) || memcmp(bytes, entries[i], sizeof(bytes))) return @"";
     }
-    static const uint8_t nicknameRead[16] = {0xe9,0x5f,0x40,0xf9,0xa9,0x00,0x00,0xb4,0x21,0xa1,0x02,0x91,0xe0,0x03,0x13,0xaa};
-    uint8_t bytes[16];
+    // 0x22320D8 是 269079 的昵称读取点指纹；270102 该区域已重写，跳过此锚点，
+    // 昵称缺失时回退为成员 ID 显示。
     uintptr_t app = 0;
-    if (!YMSafeReadMemory(YMRuntimeAddress(0x22320D8), bytes, 16) || memcmp(bytes, nicknameRead, 16) ||
-        !YMSafeReadPointer(YMRuntimeAddress(0x9312568), &app) || !app) return @"";
+    uintptr_t appSlot = build270102 ? 0xA29B988 : 0x9312568;
+    if (!build270102) {
+        static const uint8_t nicknameRead[16] = {0xe9,0x5f,0x40,0xf9,0xa9,0x00,0x00,0xb4,0x21,0xa1,0x02,0x91,0xe0,0x03,0x13,0xaa};
+        uint8_t bytes[16];
+        if (!YMSafeReadMemory(YMRuntimeAddress(0x22320D8), bytes, 16) || memcmp(bytes, nicknameRead, 16) ||
+            !YMSafeReadPointer(YMRuntimeAddress(appSlot), &app) || !app) return @"";
+    } else if (!YMSafeReadPointer(YMRuntimeAddress(appSlot), &app) || !app) {
+        return @"";
+    }
     return YMReadCachedMemberName(memberID, roomID, capturedGroupName, functions);
 }
 
@@ -2900,9 +3046,11 @@ static BOOL YMGroupExitUsesResponseCapture(void) {
     const auto *profile = YMGetActiveProfile();
     return profile && strcmp(profile->buildVersion, "269079") == 0;
 }
+struct YMGroupExitABICheck { uintptr_t address; uint8_t bytes[16]; };
+
 static BOOL YMGroupExitCaptureABIReady(void) {
     if (!YMGroupExitUsesResponseCapture() || !YMMatchesWeChat269079Dylib()) return NO;
-    static const struct { uintptr_t address; uint8_t bytes[16]; } entries[] = {
+    static const YMGroupExitABICheck entries269079[] = {
         {0x30760, {0x28,0x00,0x80,0x52,0x08,0x00,0x00,0xb9,0x01,0x88,0x00,0xa9,0x08,0x00,0x00,0x90}},
         {0x3084C, {0x08,0x00,0x40,0xf9,0xe8,0x01,0x00,0xb4,0x09,0x00,0x80,0x12,0x09,0x01,0xe9,0xb8}},
         {0x4713AC0, {0xff,0x43,0x01,0xd1,0xf8,0x5f,0x01,0xa9,0xf6,0x57,0x02,0xa9,0xf4,0x4f,0x03,0xa9}},
@@ -2913,20 +3061,45 @@ static BOOL YMGroupExitCaptureABIReady(void) {
         {0x597C66C, {0x08,0x0c,0x05,0x91,0x08,0xfd,0xdf,0x08,0x00,0x01,0x00,0x12,0xc0,0x03,0x5f,0xd6}},
         {0x3934FCC, {0xfc,0x6f,0xbd,0xa9,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91}},
     };
-    for (const auto &entry : entries) {
+    // 270102 对应入口（含本地系统消息插入）。捕获点本身不适配，此表只服务
+    // 调度器/通知链路（YMGroupExitPost 与退群监控的通知刷新）。
+    static const YMGroupExitABICheck entries270102[] = {
+        {0x31C40, {0x28,0x00,0x80,0x52,0x08,0x00,0x00,0xb9,0x01,0x88,0x00,0xa9,0x08,0x00,0x00,0x90}},
+        {0x31D2C, {0x08,0x00,0x40,0xf9,0xe8,0x01,0x00,0xb4,0x09,0x00,0x80,0x12,0x09,0x01,0xe9,0xb8}},
+        {0x4A17228, {0xff,0x43,0x01,0xd1,0xf8,0x5f,0x01,0xa9,0xf6,0x57,0x02,0xa9,0xf4,0x4f,0x03,0xa9}},
+        {0x451941C, {0x08,0xec,0x02,0xd0,0x00,0xc5,0x44,0xf9,0xc0,0x03,0x5f,0xd6,0xff,0xc3,0x00,0xd1}},
+        {0x451AA1C, {0x0a,0x48,0x41,0xf9,0x09,0x4c,0x41,0xf9,0x0a,0x25,0x00,0xa9,0x89,0x00,0x00,0xb4}},
+        {0x43EDF08, {0xff,0xc3,0x06,0xd1,0xfc,0x6f,0x16,0xa9,0xf8,0x5f,0x17,0xa9,0xf6,0x57,0x18,0xa9}},
+        {0x6500484, {0xff,0x83,0x06,0xd1,0xf6,0x57,0x17,0xa9,0xf4,0x4f,0x18,0xa9,0xfd,0x7b,0x19,0xa9}},
+        {0x6500BA0, {0x08,0x0c,0x05,0x91,0x08,0xfd,0xdf,0x08,0x00,0x01,0x00,0x12,0xc0,0x03,0x5f,0xd6}},
+        {0x42E716C, {0xfc,0x6f,0xbd,0xa9,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91}},
+    };
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    const BOOL build270102 = profile && strcmp(profile->buildVersion, "270102") == 0;
+    const YMGroupExitABICheck *entries = build270102 ? entries270102 : entries269079;
+    const size_t count = build270102 ? sizeof(entries270102) / sizeof(entries270102[0])
+                                     : sizeof(entries269079) / sizeof(entries269079[0]);
+    for (size_t index = 0; index < count; index++) {
         uint8_t bytes[16];
-        if (!YMSafeReadMemory(YMRuntimeAddress(entry.address), bytes, sizeof(bytes)) ||
-            memcmp(bytes, entry.bytes, sizeof(bytes))) return NO;
+        if (!YMSafeReadMemory(YMRuntimeAddress(entries[index].address), bytes, sizeof(bytes)) ||
+            memcmp(bytes, entries[index].bytes, sizeof(bytes))) return NO;
     }
     return YES;
 }
 
 static bool YMGroupExitPost(std::function<void()> work) {
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    const BOOL build270102 = profile && strcmp(profile->buildVersion, "270102") == 0;
+    const uintptr_t runnerSlot = build270102 ? 0xA35B380 : 0x93B02B0;
+    const uintptr_t envSlot = build270102 ? 0xA35B3A8 : 0x93B02D8;
+    const uintptr_t initClosure = build270102 ? 0x31C40 : 0x30760;
+    const uintptr_t releaseClosure = build270102 ? 0x31D2C : 0x3084C;
+    const uintptr_t postRawRunner = build270102 ? 0x4A17228 : 0x4713AC0;
     uintptr_t runner = 0, environment = 0;
-    if (!YMSafeReadPointer(YMRuntimeAddress(0x93B02B0), &runner) || !runner ||
-        !YMSafeReadPointer(YMRuntimeAddress(0x93B02D8), &environment) || !environment) return false;
-    const GX::SchedulerCalls calls = {(GX::InitClosure)YMRuntimeAddress(0x30760),
-        (GX::ReleaseClosure)YMRuntimeAddress(0x3084C), (GX::PostRawRunner)YMRuntimeAddress(0x4713AC0)};
+    if (!YMSafeReadPointer(YMRuntimeAddress(runnerSlot), &runner) || !runner ||
+        !YMSafeReadPointer(YMRuntimeAddress(envSlot), &environment) || !environment) return false;
+    const GX::SchedulerCalls calls = {(GX::InitClosure)YMRuntimeAddress(initClosure),
+        (GX::ReleaseClosure)YMRuntimeAddress(releaseClosure), (GX::PostRawRunner)YMRuntimeAddress(postRawRunner)};
     return GX::enqueue(calls, (void *)runner, (void *)environment, YMGroupExitLocation, std::move(work));
 }
 
@@ -2938,7 +3111,9 @@ struct YMGroupExitAccount {
 };
 static YMGroupExitAccount YMGroupExitCurrentAccount(void) {
     uintptr_t app = 0;
-    if (!YMSafeReadPointer(YMRuntimeAddress(0x9312568), &app) || !app) return {};
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    const uintptr_t appSlot = (profile && strcmp(profile->buildVersion, "270102") == 0) ? 0xA29B988 : 0x9312568;
+    if (!YMSafeReadPointer(YMRuntimeAddress(appSlot), &app) || !app) return {};
     auto context = ((YMGroupExitGetter)(*(uintptr_t **)app)[0x68 / 8])((void *)app);
     if (!context || !(((uintptr_t (*)(void *))(*(uintptr_t **)app)[0x70 / 8])((void *)app) & 1)) return {};
     auto value = ((const std::string *(*)(void *))(*(uintptr_t **)app)[0x28 / 8])((void *)app);
@@ -4247,8 +4422,14 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
         uintptr_t extObject = 0;
         YMSafeReadPointer(originalSP + extObjectSlotOffset, &extObject);
 
+        // 269079 上下文对象：svrId +360 / session +392；
+        // 270102 对应字段整体 +0x60：svrId +456 / session +488。
+        const size_t ctxSvrIdOffset = strcmp(profile->buildVersion, "270102") == 0 ? 456 : 360;
+        const size_t ctxSessionOffset = strcmp(profile->buildVersion, "270102") == 0 ? 488 : 392;
+        // optional 的 engaged 标志紧跟 Wrap 本体之后（269079=+616 / 270102=+632）。
+        const size_t wrapHasValueOffset = profile->layout.messageWrapSize;
         uint8_t hasValue = 0;
-        YMSafeReadMemory(outWrap + 616, &hasValue, sizeof(hasValue));
+        YMSafeReadMemory(outWrap + wrapHasValueOffset, &hasValue, sizeof(hasValue));
 
         YMLog(@"[RevokeCallsite] after GetMessageBySvrId originalSP=0x%lx outWrap=0x%lx dstOff=0x%lx has=%u ext=0x%lx extOff=0x%lx",
               (unsigned long)originalSP,
@@ -4280,7 +4461,7 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
                                                                    YMSelfRevokeWrapIdentity(outWrap));
                 if (!YMPrepareSelfRevoke(originalSP, retain)) {
                     // 不允许注册失败后销毁用户要求保留的原消息。
-                    if (retain) *((volatile uint8_t *)(outWrap + 616)) = 0;
+                    if (retain) *((volatile uint8_t *)(outWrap + wrapHasValueOffset)) = 0;
                     YMLog(@"[SelfRevoke] event unavailable; retain=%d native reedit not guaranteed", retain);
                     return;
                 }
@@ -4291,10 +4472,10 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
         }
 
         uint64_t svrId = 0;
-        YMSafeReadMemory(extObject + 360, &svrId, sizeof(svrId));
+        YMSafeReadMemory(extObject + ctxSvrIdOffset, &svrId, sizeof(svrId));
 
-        std::string *sessionString = (std::string *)(extObject + 392);
-        NSString *sessionText = YMNSStringFromLibcppStringObject((const void *)(extObject + 392));
+        std::string *sessionString = (std::string *)(extObject + ctxSessionOffset);
+        NSString *sessionText = YMNSStringFromLibcppStringObject((const void *)(extObject + ctxSessionOffset));
 
         uint32_t originType = 0;
         uint32_t originType12 = 0;
@@ -4424,7 +4605,7 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
         if (own) return; // 本人路径只由已冻结的原生删除/替换策略控制。
 
         // 他人防撤回继续沿用现有本地提示与保留路径。
-        *((volatile uint8_t *)(outWrap + 616)) = 0;
+        *((volatile uint8_t *)(outWrap + wrapHasValueOffset)) = 0;
         YMLog(@"[RevokeCallsite] clear local origin optional flag to prevent current UI revoke replacement");
     }
 }
@@ -4492,9 +4673,19 @@ __asm__(
 "    ldr  x16, [x16, _YMRevokeOriginCallsiteModeValue@PAGEOFF]\n"
 "    cmp  x16, #1\n"
 "    b.eq L_YMRevokeCallsiteV411\n"
+"    cmp  x16, #2\n"
+"    b.eq L_YMRevokeCallsiteV270102\n"
 
 // 4.1.10 legacy branch
 "    ldr x22, [sp, #0x2D8]\n"
+"    cbz x22, L_YMRevokeCallsiteZero\n"
+"    add x8, x22, #8\n"
+"    mov x9, #-1\n"
+"    b L_YMRevokeCallsiteContinue\n"
+
+// 270102 branch：与 4.1.10 同形，仅 ldr 栈偏移不同（outWrap 缓冲区整体 +0x20）。
+"L_YMRevokeCallsiteV270102:\n"
+"    ldr x22, [sp, #0x308]\n"
 "    cbz x22, L_YMRevokeCallsiteZero\n"
 "    add x8, x22, #8\n"
 "    mov x9, #-1\n"

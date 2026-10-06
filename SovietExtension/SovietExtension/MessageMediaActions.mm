@@ -16,15 +16,61 @@
 #include <limits.h>
 
 #if defined(__aarch64__)
-// Build269079 arm64，入口由菜单完成版本/UUID校验后初始化。
+// Build269079 / 270102 arm64，入口由菜单完成版本/UUID校验后初始化。
+// 270102 的 MessageData 快照为 0x350：+0xb0..+0x108 区间字段 +8，≥+0x110 区间 +0x10。
 static bool YMImageLookupReady = false;
 static bool YMStickerLookupReady = false;
 static bool YMStickerSaveReady = false;
+
+// 每个构建的函数入口 + 快照布局常量。
+struct YMMessageMediaABI {
+    uintptr_t pathDtor, pathString, md5Getter, appGetter, rootByKind;
+    uintptr_t persistFlag, persistByte, monthDir, imageResPathGetter;
+    uintptr_t extCast, typeDescBase, typeDescImage, typeDescSticker;
+    uintptr_t keyGetter, bufCtor, bufDtor, decoder, bufDataPtr, bufSize;
+    uintptr_t wxgfCheck, wxgfInfo, wxamConvert, descGetter, descVtable;
+    uintptr_t svcToken, registryLookup, schedulerGetter, stickerDownload;
+    uintptr_t taskSpawn, taskVtable, taskDone, taskCancel;
+    uintptr_t restrictionFlagOffset;   // 快照内文件限制字节
+    uintptr_t availabilityAOffset;     // 图片下载状态分支的两个 dword
+    uintptr_t availabilityBOffset;
+    uintptr_t extPointerOffset;        // 快照内扩展 shared_ptr
+    uintptr_t imageExtGateOffset;      // 图片扩展 +0x190 门控 dword
+    uintptr_t stickerDescOffset;       // 表情扩展 emoji.desc string
+    uintptr_t stickerResourceAOffset;  // 表情资源指针对
+    uintptr_t stickerResourceBOffset;
+};
+
+static const YMMessageMediaABI &MMA(void) {
+    static const YMMessageMediaABI k269079 = {
+        0x2826c, 0x2ad1c, 0x448246c, 0x428d0bc, 0x428dc4c,
+        0x9319470, 0x9319468, 0x434274c, 0x449aa78,
+        0x63f23f4, 0x8e1b500, 0x8e1c6f8, 0x8e1b818,
+        0x434f9a4, 0x3b3adec, 0x3b3aee0, 0x3b3a0d8, 0x8736c, 0x2af18,
+        0x477095c, 0x63f3f54, 0x63f3f9c, 0x47f2db4, 0x8e16c20,
+        0x8b7ca40, 0x3a58b24, 0x428e6a0, 0x34e49a4,
+        0x3a280f0, 0x8eb9550, 0x597c66c, 0x597be88,
+        0x1c9, 0xa4, 0xac, 0x208, 0x190, 0x2b0, 0x228, 0x230,
+    };
+    static const YMMessageMediaABI k270102 = {
+        0x29440, 0x2bef0, 0x4754194, 0x451941c, 0x4519fc8,
+        0xa2a43f0, 0xa2a43e8, 0x45ea92c, 0x476de94,
+        0x6fd1020, 0x9cfc8c8, 0x9cfdca0, 0x9cfcbe0,
+        0x45fb260, 0x45095b4, 0x45096a8, 0x45088a0, 0x888b8, 0x2c264,
+        0x4a798cc, 0x6fd2bbc, 0x6fd2c04, 0x4b060b0, 0x9cf7e48,
+        0x9a62850, 0x4420090, 0x451aa1c, 0x3e63a24,
+        0x43edf08, 0x9dfcef8, 0x6500ba0, 0x6500484,
+        0x1d9, 0xac, 0xb4, 0x218, 0x1a0, 0x2c0, 0x238, 0x240,
+    };
+    NSString *build = [NSBundle mainBundle].infoDictionary[@"CFBundleVersion"];
+    return [build isEqualToString:@"270102"] ? k270102 : k269079;
+}
+
 struct YMMessageMediaPath {
     // 微信的24字节路径对象，非平凡返回值使用x8；借助原生转换复制成自有string。
     alignas(8) uint8_t storage[24];
-    ~YMMessageMediaPath() { ((void (*)(void *))YMRuntimeAddress(0x2826c))(this); }
-    std::string string() const { return ((std::string (*)(const void *))YMRuntimeAddress(0x2ad1c))(this); }
+    ~YMMessageMediaPath() { ((void (*)(void *))YMRuntimeAddress(MMA().pathDtor))(this); }
+    std::string string() const { return ((std::string (*)(const void *))YMRuntimeAddress(MMA().pathString))(this); }
 };
 static_assert(sizeof(YMMessageMediaPath) == 24);
 
@@ -44,25 +90,26 @@ static NSURL *YMMessageMediaFileURL(const std::string &path) {
 }
 
 static NSURL *YMMessageLocalURL(const YMMessageSnapshot &message) {
+    const YMMessageMediaABI &abi = MMA();
     const auto *data = message.storage;
-    if (data[0x1c9]) return nil; // 保留原生文件操作的限制。
+    if (data[abi.restrictionFlagOffset]) return nil; // 保留原生文件操作的限制。
     const uint32_t type = *(const uint32_t *)(data + 8);
     if (type == 47 && YMStickerLookupReady) {
-        const auto md5 = ((std::string (*)(const void *))YMRuntimeAddress(0x448246c))(&message);
+        const auto md5 = ((std::string (*)(const void *))YMRuntimeAddress(abi.md5Getter))(&message);
         if (md5.size() != 32 || md5.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return nil;
-        void *account = ((void *(*)())YMRuntimeAddress(0x428d0bc))();
+        void *account = ((void *(*)())YMRuntimeAddress(abi.appGetter))();
         if (!account) return nil;
         auto root = [&](int kind) {
             using Root = YMMessageMediaPath (*)(void *, const int *);
-            auto path = ((Root)YMRuntimeAddress(0x428dc4c))(account, &kind);
+            auto path = ((Root)YMRuntimeAddress(abi.rootByKind))(account, &kind);
             return path.string();
         };
         const auto suffix = "/" + md5.substr(0, 2) + "/" + md5;
         const auto legacy = root(11);
         if (!legacy.empty() && legacy.front() == '/') {
-            const auto initialized = __atomic_load_n((uint64_t *)YMRuntimeAddress(0x9319470), __ATOMIC_ACQUIRE);
+            const auto initialized = __atomic_load_n((uint64_t *)YMRuntimeAddress(abi.persistFlag), __ATOMIC_ACQUIRE);
             if (initialized == UINT64_MAX) {
-                const char *directory = *(const uint8_t *)YMRuntimeAddress(0x9319468) ? "/Persistence" : "/Persist";
+                const char *directory = *(const uint8_t *)YMRuntimeAddress(abi.persistByte) ? "/Persistence" : "/Persist";
                 if (NSURL *url = YMMessageMediaFileURL(legacy + directory + suffix)) return url;
             } else {
                 // 初始化会迁移/mkdir；这里只读检查原生两种旧目录，不触发初始化。
@@ -72,27 +119,28 @@ static NSURL *YMMessageLocalURL(const YMMessageSnapshot &message) {
         }
         const auto current = root(15);
         if (current.empty() || current.front() != '/') return nil;
-        auto month = ((YMMessageMediaPath (*)(uint32_t))YMRuntimeAddress(0x434274c))((uint32_t)time(nullptr));
+        auto month = ((YMMessageMediaPath (*)(uint32_t))YMRuntimeAddress(abi.monthDir))((uint32_t)time(nullptr));
         const auto component = month.string();
         if (component.empty() || component == "." || component == ".." || component.find('/') != std::string::npos) return nil;
-        // 精确复现4350ba4的完整候选，绕过其中mkdir；不查.thumb/.temp/.icon或其他月份。
+        // 精确复现原生月份目录候选，绕过其中mkdir；不查.thumb/.temp/.icon或其他月份。
         return YMMessageMediaFileURL(current + "/" + component + "/Emoticon" + suffix);
     }
     if (!YMImageLookupReady || type != 3) return nil;
-    // 与0x48c1be8的图片可用性分支一致；路径存在本身不足以判断下载状态。
-    if (*(const uint32_t *)(data + 0xac) != 2 && (*(const uint32_t *)(data + 0xa4) | 4) == 5) return nil;
+    // 与原生图片可用性分支一致；路径存在本身不足以判断下载状态。
+    if (*(const uint32_t *)(data + abi.availabilityBOffset) != 2 &&
+        (*(const uint32_t *)(data + abi.availabilityAOffset) | 4) == 5) return nil;
     auto getURL = [&](int resource) -> NSURL * {
         using Getter = YMMessageMediaPath (*)(const void *, const int *, bool);
-        auto path = ((Getter)YMRuntimeAddress(0x449aa78))(&message, &resource, false);
+        auto path = ((Getter)YMRuntimeAddress(abi.imageResPathGetter))(&message, &resource, false);
         return YMMessageMediaFileURL(path.string());
     };
-    // 快照持有扩展的shared_ptr。仅同步借用，与原生0x48c1918的资源3→2选择一致。
-    void *extension = *(void *const *)(data + 0x208);
+    // 快照持有扩展的shared_ptr。仅同步借用，与原生资源3→2选择一致。
+    void *extension = *(void *const *)(data + abi.extPointerOffset);
     if (extension) {
         using Cast = void *(*)(const void *, uintptr_t, uintptr_t, ptrdiff_t);
-        auto image = ((Cast)YMRuntimeAddress(0x63f23f4))(
-            extension, YMRuntimeAddress(0x8e1b500), YMRuntimeAddress(0x8e1c6f8), 0);
-        if (image && *(const uint32_t *)((uint8_t *)image + 0x190)) {
+        auto image = ((Cast)YMRuntimeAddress(abi.extCast))(
+            extension, YMRuntimeAddress(abi.typeDescBase), YMRuntimeAddress(abi.typeDescImage), 0);
+        if (image && *(const uint32_t *)((uint8_t *)image + abi.imageExtGateOffset)) {
             if (NSURL *url = getURL(3)) return url;
         }
     }
@@ -118,14 +166,14 @@ struct YMStickerAccountContext {
     bool operator!=(const YMStickerAccountContext &other) const { return !(*this == other); }
 };
 static YMStickerAccountContext YMStickerAccount() {
-    void *app = ((void *(*)())YMRuntimeAddress(0x428d0bc))();
+    void *app = ((void *(*)())YMRuntimeAddress(MMA().appGetter))();
     if (!app) return {};
     using Getter = std::shared_ptr<void> (*)(void *);
     YMStickerAccountContext result;
     result.service = ((Getter)(*(uintptr_t **)app)[0x68 / 8])(app);
     if (!result.service) return {};
     auto root = [&](int kind) {
-        auto path = ((YMMessageMediaPath (*)(void *, const int *))YMRuntimeAddress(0x428dc4c))(app, &kind);
+        auto path = ((YMMessageMediaPath (*)(void *, const int *))YMRuntimeAddress(MMA().rootByKind))(app, &kind);
         return path.string();
     };
     result.legacyRoot = root(11);
@@ -191,20 +239,21 @@ static NSData *YMStickerDecodedBytes(NSURL *url) {
     if (!input) return nil;
     if (YMStickerImageType(input)) return input; // 旧缓存也可能已经是标准媒体。
     if (input.length < 16 || input.length % 16) return nil;
-    auto key = ((std::string (*)())YMRuntimeAddress(0x434f9a4))();
+    const YMMessageMediaABI &abi = MMA();
+    auto key = ((std::string (*)())YMRuntimeAddress(abi.keyGetter))();
     if (key.empty() || key.size() > UINT32_MAX) return nil;
     struct Buffer {
         alignas(8) uint8_t storage[24];
-        Buffer() { ((void (*)(void *))YMRuntimeAddress(0x3b3adec))(this); }
-        ~Buffer() { ((void (*)(void *))YMRuntimeAddress(0x3b3aee0))(this); }
+        Buffer() { ((void (*)(void *))YMRuntimeAddress(MMA().bufCtor))(this); }
+        ~Buffer() { ((void (*)(void *))YMRuntimeAddress(MMA().bufDtor))(this); }
     } output;
     using Decode = int (*)(const void *, uint32_t, void *, const void *, uint32_t);
-    const int result = ((Decode)YMRuntimeAddress(0x3b3a0d8))(
+    const int result = ((Decode)YMRuntimeAddress(abi.decoder))(
         input.bytes, (uint32_t)input.length, &output, key.data(), (uint32_t)key.size());
     for (size_t i = 0; i < key.size(); ++i) ((volatile char *)key.data())[i] = 0; // 密钥只在此处瞬时使用，不写日志或磁盘。
     if (result) return nil;
-    const void *data = ((const void *(*)(const void *))YMRuntimeAddress(0x8736c))(&output);
-    const uint32_t size = ((uint32_t (*)(const void *))YMRuntimeAddress(0x2af18))(&output);
+    const void *data = ((const void *(*)(const void *))YMRuntimeAddress(abi.bufDataPtr))(&output);
+    const uint32_t size = ((uint32_t (*)(const void *))YMRuntimeAddress(abi.bufSize))(&output);
     if (!data || !size || size > input.length) return nil;
     return [NSData dataWithBytes:data length:size];
 }
@@ -212,11 +261,12 @@ static NSData *YMStickerDecodedBytes(NSURL *url) {
 static NSData *YMStickerExportBytes(NSData *bytes) {
     if (!bytes.length || bytes.length > 64 * 1024 * 1024) return nil;
     if (YMStickerImageType(bytes)) return bytes;
-    if (bytes.length < 4 || !((bool (*)(const void *, size_t))YMRuntimeAddress(0x477095c))(bytes.bytes, bytes.length)) return nil;
+    const YMMessageMediaABI &abi = MMA();
+    if (bytes.length < 4 || !((bool (*)(const void *, size_t))YMRuntimeAddress(abi.wxgfCheck))(bytes.bytes, bytes.length)) return nil;
     // WXAM解密后仍是私有图片容器；微信原生mode3导出完整GIF，mode0只会得到首帧JPEG。
     // 原生输出52字节，前三个int32为宽/高/帧数；options固定32字节。
     int32_t info[13] = {};
-    if (((int (*)(const void *, int, void *))YMRuntimeAddress(0x63f3f54))(bytes.bytes, (int)bytes.length, info)) return nil;
+    if (((int (*)(const void *, int, void *))YMRuntimeAddress(abi.wxgfInfo))(bytes.bytes, (int)bytes.length, info)) return nil;
     if (info[0] <= 0 || info[1] <= 0 || info[2] <= 0 || info[0] > 16384 || info[1] > 16384 || info[2] > 1000) return nil;
     const uint64_t pixels = (uint64_t)info[0] * (uint64_t)info[1];
     const uint64_t totalPixels = pixels * (uint64_t)info[2];
@@ -226,12 +276,12 @@ static NSData *YMStickerExportBytes(NSData *bytes) {
     using Convert = int (*)(const void *, int, void *, int *, const void *);
     NSMutableData *output = [NSMutableData dataWithLength:(NSUInteger)capacity];
     int length = capacity;
-    int status = ((Convert)YMRuntimeAddress(0x63f3f9c))(bytes.bytes, (int)bytes.length, output.mutableBytes, &length, options);
+    int status = ((Convert)YMRuntimeAddress(abi.wxamConvert))(bytes.bytes, (int)bytes.length, output.mutableBytes, &length, options);
     // -206表示输出缓冲区不足，length返回所需容量；仅在上限内扩容重试一次。
     if (status == -206 && length > capacity && length <= 64 * 1024 * 1024) {
         capacity = length;
         output.length = (NSUInteger)capacity;
-        status = ((Convert)YMRuntimeAddress(0x63f3f9c))(bytes.bytes, (int)bytes.length, output.mutableBytes, &length, options);
+        status = ((Convert)YMRuntimeAddress(abi.wxamConvert))(bytes.bytes, (int)bytes.length, output.mutableBytes, &length, options);
     }
     if (status || length <= 0 || length > capacity) return nil;
     output.length = (NSUInteger)length;
@@ -249,16 +299,17 @@ static NSData *YMStickerExportBytes(NSData *bytes) {
 }
 
 static NSString *YMStickerFileName(const YMMessageSnapshot &message, UTType *type) {
-    const auto md5 = ((std::string (*)(const void *))YMRuntimeAddress(0x448246c))(&message);
+    const YMMessageMediaABI &abi = MMA();
+    const auto md5 = ((std::string (*)(const void *))YMRuntimeAddress(abi.md5Getter))(&message);
     NSString *name = [NSString stringWithUTF8String:md5.c_str()]; // 已在保存入口校验32位资源标识。
-    void *extension = *(void *const *)(message.storage + 0x208);
+    void *extension = *(void *const *)(message.storage + abi.extPointerOffset);
     if (extension) {
         using Cast = void *(*)(const void *, uintptr_t, uintptr_t, ptrdiff_t);
-        void *sticker = ((Cast)YMRuntimeAddress(0x63f23f4))(
-            extension, YMRuntimeAddress(0x8e1b500), YMRuntimeAddress(0x8e1b818), 0);
+        void *sticker = ((Cast)YMRuntimeAddress(abi.extCast))(
+            extension, YMRuntimeAddress(abi.typeDescBase), YMRuntimeAddress(abi.typeDescSticker), 0);
         if (sticker) {
-            // emoji.desc由0x486b834写入扩展+0x2b0，0x480113c消费；可为空，并非保证存在的名称。
-            const auto &text = *(const std::string *)((const uint8_t *)sticker + 0x2b0);
+            // emoji.desc 由原生写入扩展内部，可为空，并非保证存在的名称。
+            const auto &text = *(const std::string *)((const uint8_t *)sticker + abi.stickerDescOffset);
             if (!text.empty() && text.size() <= 4096) {
                 NSString *description = [[NSString alloc] initWithBytes:text.data() length:text.size() encoding:NSUTF8StringEncoding];
                 NSMutableCharacterSet *invalid = [NSCharacterSet.controlCharacterSet mutableCopy];
@@ -287,29 +338,31 @@ static void YMStickerSave(std::shared_ptr<YMMessageSnapshot> message,
                           YMStickerAccountContext account) {
     using Shared = std::shared_ptr<void>;
     using Getter = Shared (*)(void *);
+    const YMMessageMediaABI &abi = MMA();
     if (!account || YMStickerAccount() != account) {
         YMStickerSaveError(@"登录账号已改变，请重新打开消息菜单。"); return;
     }
-    if (!*(void *const *)(message->storage + 0x228) || !*(void *const *)(message->storage + 0x230)) {
+    if (!*(void *const *)(message->storage + abi.stickerResourceAOffset) ||
+        !*(void *const *)(message->storage + abi.stickerResourceBOffset)) {
         YMStickerSaveError(@"所选表情的资源信息已失效，请重新打开消息菜单。"); return;
     }
-    auto descriptor = ((Shared (*)(const void *))YMRuntimeAddress(0x47f2db4))(message.get());
-    const auto md5 = ((std::string (*)(const void *))YMRuntimeAddress(0x448246c))(message.get());
-    if (!descriptor || *(uintptr_t *)descriptor.get() != YMRuntimeAddress(0x8e16c20) ||
+    auto descriptor = ((Shared (*)(const void *))YMRuntimeAddress(abi.descGetter))(message.get());
+    const auto md5 = ((std::string (*)(const void *))YMRuntimeAddress(abi.md5Getter))(message.get());
+    if (!descriptor || *(uintptr_t *)descriptor.get() != YMRuntimeAddress(abi.descVtable) ||
         md5.size() != 32 || md5.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos ||
         *(const std::string *)((const uint8_t *)descriptor.get() + 0x10) != md5) {
         YMStickerSaveError(@"无法取得所选表情的完整资源。"); return;
     }
     auto registry = ((Getter)(*(uintptr_t **)account.service.get())[0x30 / 8])(account.service.get());
     if (!registry) { YMStickerSaveError(@"表情下载服务不可用。"); return; }
-    uintptr_t token = YMRuntimeAddress(0x8b7ca40);
-    auto service = ((Shared (*)(void *, const uintptr_t *))YMRuntimeAddress(0x3a58b24))(registry.get(), &token);
-    void *app = ((void *(*)())YMRuntimeAddress(0x428d0bc))();
-    auto scheduler = app ? ((Getter)YMRuntimeAddress(0x428e6a0))(app) : Shared{};
+    uintptr_t token = YMRuntimeAddress(abi.svcToken);
+    auto service = ((Shared (*)(void *, const uintptr_t *))YMRuntimeAddress(abi.registryLookup))(registry.get(), &token);
+    void *app = ((void *(*)())YMRuntimeAddress(abi.appGetter))();
+    auto scheduler = app ? ((Getter)YMRuntimeAddress(abi.schedulerGetter))(app) : Shared{};
     if (!service || !scheduler) { YMStickerSaveError(@"表情下载服务不可用。"); return; }
     // 主线程持有任务句柄，工作闭包只持有终态标记，避免Task/闭包循环引用。
     auto finished = std::make_shared<std::atomic_bool>(false);
-    std::function<void()> work = [message, account, descriptor, service, finished] {
+    std::function<void()> work = [message, account, descriptor, service, finished, abi] {
         @autoreleasepool {
             NSData *bytes = nil;
             NSURL *sourceURL = nil;
@@ -320,7 +373,7 @@ static void YMStickerSave(std::shared_ptr<YMMessageSnapshot> message,
                     sourceURL = YMMessageLocalURL(*message);
                     bool available = sourceURL != nil;
                     if (!available) {
-                        auto result = ((YMStickerDownloadResult (*)(void *, const Shared *, int))YMRuntimeAddress(0x34e49a4))(
+                        auto result = ((YMStickerDownloadResult (*)(void *, const Shared *, int))YMRuntimeAddress(abi.stickerDownload))(
                             service.get(), &descriptor, 0);
                         available = result.ok;
                     }
@@ -373,16 +426,17 @@ static void YMStickerSave(std::shared_ptr<YMMessageSnapshot> message,
         }
     };
     static const YMStickerSourceLocation location = {"YMStickerSave", "MessageMediaActions.mm", __LINE__, 0, 0};
-    auto task = ((Shared (*)(void *, const YMStickerSourceLocation *, std::function<void()> *, int))YMRuntimeAddress(0x3a280f0))(
+    auto task = ((Shared (*)(void *, const YMStickerSourceLocation *, std::function<void()> *, int))YMRuntimeAddress(abi.taskSpawn))(
         scheduler.get(), &location, &work, 1);
-    if (!task || *(uintptr_t *)task.get() != YMRuntimeAddress(0x8eb9550) ||
-        ((bool (*)(void *))YMRuntimeAddress(0x597c66c))(task.get())) {
+    if (!task || *(uintptr_t *)task.get() != YMRuntimeAddress(abi.taskVtable) ||
+        ((bool (*)(void *))YMRuntimeAddress(abi.taskDone))(task.get())) {
         finished->store(true); YMStickerSaveError(@"无法启动表情保存，请稍后重试。"); return;
     }
     // 超时终止本次保存订阅；微信复用的底层下载不保证随之终止。
+    const uintptr_t taskCancelVA = abi.taskCancel;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         if (finished->exchange(true)) return;
-        ((void (*)(void *))YMRuntimeAddress(0x597be88))(task.get());
+        ((void (*)(void *))YMRuntimeAddress(taskCancelVA))(task.get());
         YMStickerSaveError(@"获取表情超时，已停止本次保存。请检查网络后重试。");
     });
 }
@@ -416,7 +470,8 @@ std::function<void()> YMMessageMediaActions::revealAction(std::shared_ptr<YMMess
 }
 
 std::function<void()> YMMessageMediaActions::saveAction(std::shared_ptr<YMMessageSnapshot> message) {
-    if (*(const uint32_t *)(message->storage + 8) != 47 || !YMStickerSaveReady || message->storage[0x1c9]) return {};
+    if (*(const uint32_t *)(message->storage + 8) != 47 || !YMStickerSaveReady ||
+        message->storage[MMA().restrictionFlagOffset]) return {};
     auto account = YMStickerAccount();
     if (!account) return {};
     return [message, account, used = false]() mutable {
@@ -432,20 +487,20 @@ std::function<void()> YMMessageMediaActions::saveAction(std::shared_ptr<YMMessag
 void YMMessageMediaActions::validateABI() {
     struct Entry { uintptr_t offset; uint8_t bytes[16]; };
     // 资源适配独立失败时保留+1；图片与表情只共享路径生命周期的必要校验。
-    static const Entry pathEntries[] = {
+    static const Entry pathEntries269079[] = {
         {0x2826c, {0x08, 0x5c, 0xc0, 0x39, 0x48, 0x00, 0xf8, 0x37, 0xc0, 0x03, 0x5f, 0xd6, 0xf4, 0x4f, 0xbe, 0xa9}},
         {0x2ad1c, {0x09, 0x5c, 0xc0, 0x39, 0xc9, 0x00, 0xf8, 0x37, 0x00, 0x00, 0xc0, 0x3d, 0x00, 0x01, 0x80, 0x3d}},
         {0x63f23f4, {0xf0, 0x36, 0x01, 0x90, 0x10, 0xb2, 0x45, 0xf9, 0x00, 0x02, 0x1f, 0xd6, 0xf0, 0x36, 0x01, 0x90}},
         {0x48c2ad4, {0x00, 0x24, 0x47, 0x39, 0xc0, 0x03, 0x5f, 0xd6, 0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9}},
         {0x950278, {0xf8, 0x23, 0x00, 0xb9, 0x20, 0x03, 0x7d, 0xb2, 0xe1, 0x03, 0x17, 0xaa, 0x64, 0x92, 0x61, 0x95}},
     };
-    static const Entry imageEntries[] = {
+    static const Entry imageEntries269079[] = {
         {0x449aa78, {0xff, 0x83, 0x06, 0xd1, 0xfa, 0x67, 0x15, 0xa9, 0xf8, 0x5f, 0x16, 0xa9, 0xf6, 0x57, 0x17, 0xa9}},
         {0x48c1a10, {0xc1, 0x2a, 0x02, 0xd0, 0x21, 0x00, 0x14, 0x91, 0xc2, 0x2a, 0x02, 0xf0, 0x42, 0xe0, 0x1b, 0x91}},
         {0x48c1a44, {0x08, 0x90, 0x41, 0xb9, 0xa8, 0x03, 0x00, 0x34, 0x68, 0x00, 0x80, 0x52, 0xa8, 0xc3, 0x1d, 0xb8}},
         {0x48c1c54, {0x68, 0xae, 0x40, 0xb9, 0x1f, 0x09, 0x00, 0x71, 0xa0, 0x46, 0x00, 0x54, 0x68, 0xa6, 0x40, 0xb9}},
     };
-    static const Entry stickerEntries[] = {
+    static const Entry stickerEntries269079[] = {
         {0x448246c, {0xff, 0xc3, 0x00, 0xd1, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91}},
         {0x428d0bc, {0x28, 0x84, 0x02, 0xb0, 0x00, 0xb5, 0x42, 0xf9, 0xc0, 0x03, 0x5f, 0xd6, 0xff, 0xc3, 0x00, 0xd1}},
         {0x428dc4c, {0xff, 0x43, 0x01, 0xd1, 0xf6, 0x57, 0x02, 0xa9, 0xf4, 0x4f, 0x03, 0xa9, 0xfd, 0x7b, 0x04, 0xa9}},
@@ -457,7 +512,7 @@ void YMMessageMediaActions::validateABI() {
         {0x43500e4, {0x48, 0x7e, 0x02, 0xb0, 0x08, 0xa1, 0x51, 0x39, 0x1f, 0x01, 0x00, 0x71, 0xe8, 0xe3, 0x00, 0x91}},
         {0x47f2460, {0xff, 0x43, 0x01, 0xd1, 0xf4, 0x4f, 0x03, 0xa9, 0xfd, 0x7b, 0x04, 0xa9, 0xfd, 0x03, 0x01, 0x91}},
     };
-    static const Entry saveEntries[] = {
+    static const Entry saveEntries269079[] = {
         {0x486b77c, {0xc9, 0x6a, 0x01, 0x90, 0x20, 0xf9, 0x42, 0xfd, 0x89, 0x57, 0x02, 0x90, 0x29, 0xf1, 0x18, 0x91}},
         {0x486b834, {0x80, 0xc2, 0x0a, 0x91, 0xa1, 0x83, 0x03, 0xd1, 0xcf, 0x18, 0x6e, 0x94, 0xa8, 0x73, 0xd3, 0x38}},
         {0x480113c, {0x80, 0x82, 0x06, 0x91, 0xa1, 0xc2, 0x0a, 0x91, 0x8d, 0xc2, 0x6f, 0x94, 0xf4, 0x0b, 0x40, 0xf9}},
@@ -481,8 +536,68 @@ void YMMessageMediaActions::validateABI() {
         {0x2af18, {0x00, 0x08, 0x40, 0xb9, 0xc0, 0x03, 0x5f, 0xd6, 0x08, 0x08, 0x40, 0xb9, 0x09, 0x00, 0x80, 0x12}},
         {0x5938fc, {0xf0, 0xe5, 0xf3, 0x94, 0x08, 0x00, 0x40, 0xf9, 0x09, 0x35, 0x40, 0xf9, 0xe8, 0x23, 0x02, 0x91}},
     };
-    auto matches = [](const auto &checks) {
-        for (const auto &entry : checks) {
+    // 270102：图片可用性锚点（48c1a10/a44/c54）与表情 emoji 锚点（486b77c/834、480113c）
+    // 所在区域已被微信重写，无法可靠重定位，从表中移除；其余入口指纹从新镜像读取。
+    static const Entry pathEntries270102[] = {
+        {0x29440, {0x08, 0x5c, 0xc0, 0x39, 0x48, 0x00, 0xf8, 0x37, 0xc0, 0x03, 0x5f, 0xd6, 0xf4, 0x4f, 0xbe, 0xa9}},
+        {0x2bef0, {0x09, 0x5c, 0xc0, 0x39, 0xc9, 0x00, 0xf8, 0x37, 0x00, 0x00, 0xc0, 0x3d, 0x00, 0x01, 0x80, 0x3d}},
+        {0x6fd1020, {0xd0, 0x4d, 0x01, 0xb0, 0x10, 0x12, 0x46, 0xf9, 0x00, 0x02, 0x1f, 0xd6, 0xd0, 0x4d, 0x01, 0xb0}},
+        {0x4be0278, {0x00, 0x44, 0x47, 0x39, 0xc0, 0x03, 0x5f, 0xd6, 0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9}},
+        {0xcbf208, {0xf8, 0x23, 0x00, 0xb9, 0x20, 0x03, 0x7d, 0xb2, 0xe1, 0x03, 0x17, 0xaa, 0xc5, 0x06, 0x83, 0x95}},
+    };
+    static const Entry imageEntries270102[] = {
+        {0x476de94, {0xff, 0x83, 0x06, 0xd1, 0xfa, 0x67, 0x15, 0xa9, 0xf8, 0x5f, 0x16, 0xa9, 0xf6, 0x57, 0x17, 0xa9}},
+    };
+    static const Entry stickerEntries270102[] = {
+        {0x4754194, {0xff, 0xc3, 0x00, 0xd1, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91}},
+        {0x451941c, {0x08, 0xec, 0x02, 0xd0, 0x00, 0xc5, 0x44, 0xf9, 0xc0, 0x03, 0x5f, 0xd6, 0xff, 0xc3, 0x00, 0xd1}},
+        {0x4519fc8, {0xff, 0x43, 0x01, 0xd1, 0xf6, 0x57, 0x02, 0xa9, 0xf4, 0x4f, 0x03, 0xa9, 0xfd, 0x7b, 0x04, 0xa9}},
+        {0x4519fa4, {0x0a, 0xa4, 0x46, 0xa9, 0x0a, 0x25, 0x00, 0xa9, 0x89, 0x00, 0x00, 0xb4, 0x28, 0x21, 0x00, 0x91}},
+        {0x4402060, {0x21, 0x00, 0x40, 0xb9, 0x00, 0xe0, 0x0a, 0x91, 0x2e, 0xc9, 0xff, 0x17, 0xff, 0x43, 0x06, 0xd1}},
+        {0x43f4520, {0xe9, 0x03, 0x00, 0xaa, 0xe0, 0x03, 0x08, 0xaa, 0x28, 0x05, 0x40, 0xf9, 0x28, 0x05, 0x00, 0xb4}},
+        {0x45ea92c, {0xff, 0x03, 0x01, 0xd1, 0xf4, 0x4f, 0x02, 0xa9, 0xfd, 0x7b, 0x03, 0xa9, 0xfd, 0xc3, 0x00, 0x91}},
+        {0x45fb96c, {0x48, 0xe5, 0x02, 0xb0, 0x08, 0xc1, 0x0f, 0x91, 0x08, 0xc1, 0xbf, 0xf8, 0x1f, 0x05, 0x00, 0xb1}},
+        {0x45fb9a0, {0x48, 0xe5, 0x02, 0xb0, 0x08, 0xa1, 0x4f, 0x39, 0x1f, 0x01, 0x00, 0x71, 0xe8, 0xe3, 0x00, 0x91}},
+        {0x4b0573c, {0xff, 0x43, 0x01, 0xd1, 0xf4, 0x4f, 0x03, 0xa9, 0xfd, 0x7b, 0x04, 0xa9, 0xfd, 0x03, 0x01, 0x91}},
+    };
+    static const Entry saveEntries270102[] = {
+        {0x6fd2bbc, {0xd0, 0x4d, 0x01, 0xd0, 0x10, 0x0a, 0x42, 0xf9, 0x00, 0x02, 0x1f, 0xd6, 0xd0, 0x4d, 0x01, 0xd0}},
+        {0x6fd2c04, {0xd0, 0x4d, 0x01, 0xd0, 0x10, 0x22, 0x42, 0xf9, 0x00, 0x02, 0x1f, 0xd6, 0xd0, 0x4d, 0x01, 0xd0}},
+        {0x4a7994c, {0xff, 0x03, 0x03, 0xd1, 0xf4, 0x4f, 0x0a, 0xa9, 0xfd, 0x7b, 0x0b, 0xa9, 0xfd, 0xc3, 0x02, 0x91}},
+        {0x4a798cc, {0xfd, 0x7b, 0xbf, 0xa9, 0xfd, 0x03, 0x00, 0x91, 0xc3, 0x64, 0x95, 0x94, 0x1f, 0x00, 0x00, 0x71}},
+        {0x451aa1c, {0x0a, 0x48, 0x41, 0xf9, 0x09, 0x4c, 0x41, 0xf9, 0x0a, 0x25, 0x00, 0xa9, 0x89, 0x00, 0x00, 0xb4}},
+        {0x43edf08, {0xff, 0xc3, 0x06, 0xd1, 0xfc, 0x6f, 0x16, 0xa9, 0xf8, 0x5f, 0x17, 0xa9, 0xf6, 0x57, 0x18, 0xa9}},
+        {0x4420090, {0xff, 0xc3, 0x07, 0xd1, 0xfa, 0x67, 0x1a, 0xa9, 0xf8, 0x5f, 0x1b, 0xa9, 0xf6, 0x57, 0x1c, 0xa9}},
+        {0x4b060b0, {0xff, 0xc3, 0x00, 0xd1, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91}},
+        {0x3e63a24, {0xf6, 0x57, 0xbd, 0xa9, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91}},
+        {0x6500484, {0xff, 0x83, 0x06, 0xd1, 0xf6, 0x57, 0x17, 0xa9, 0xf4, 0x4f, 0x18, 0xa9, 0xfd, 0x7b, 0x19, 0xa9}},
+        {0x6500ba0, {0x08, 0x0c, 0x05, 0x91, 0x08, 0xfd, 0xdf, 0x08, 0x00, 0x01, 0x00, 0x12, 0xc0, 0x03, 0x5f, 0xd6}},
+        {0x45fb260, {0xff, 0xc3, 0x00, 0xd1, 0xf4, 0x4f, 0x01, 0xa9, 0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91}},
+        {0x45088a0, {0x2a, 0xfe, 0xff, 0x17, 0xfd, 0x7b, 0xbf, 0xa9, 0xfd, 0x03, 0x00, 0x91, 0x48, 0xca, 0x02, 0xd0}},
+        {0x4508148, {0xff, 0xc3, 0x05, 0xd1, 0xfc, 0x6f, 0x13, 0xa9, 0xf6, 0x57, 0x14, 0xa9, 0xf4, 0x4f, 0x15, 0xa9}},
+        {0x45095b4, {0x1f, 0x7c, 0x00, 0xa9, 0x1f, 0x10, 0x00, 0xb9, 0xc0, 0x03, 0x5f, 0xd6, 0xf4, 0x4f, 0xbe, 0xa9}},
+        {0x45096a8, {0x08, 0x00, 0x40, 0xf9, 0x48, 0x01, 0x00, 0xb4, 0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9}},
+        {0x888b8, {0x00, 0x00, 0x40, 0xf9, 0xc0, 0x03, 0x5f, 0xd6, 0xf6, 0x57, 0xbd, 0xa9, 0xf4, 0x4f, 0x01, 0xa9}},
+        {0x2c264, {0x00, 0x08, 0x40, 0xb9, 0xc0, 0x03, 0x5f, 0xd6, 0x08, 0x08, 0x40, 0xb9, 0x09, 0x00, 0x80, 0x12}},
+        {0x6987c8, {0x15, 0x03, 0xfa, 0x94, 0x08, 0x00, 0x40, 0xf9, 0x09, 0x35, 0x40, 0xf9, 0xe8, 0x23, 0x02, 0x91}},
+    };
+    NSString *build = [NSBundle mainBundle].infoDictionary[@"CFBundleVersion"];
+    const BOOL build270102 = [build isEqualToString:@"270102"];
+    const Entry *pathEntries = build270102 ? pathEntries270102 : pathEntries269079;
+    const size_t pathCount = build270102 ? sizeof(pathEntries270102) / sizeof(pathEntries270102[0])
+                                         : sizeof(pathEntries269079) / sizeof(pathEntries269079[0]);
+    const Entry *imageEntries = build270102 ? imageEntries270102 : imageEntries269079;
+    const size_t imageCount = build270102 ? sizeof(imageEntries270102) / sizeof(imageEntries270102[0])
+                                          : sizeof(imageEntries269079) / sizeof(imageEntries269079[0]);
+    const Entry *stickerEntries = build270102 ? stickerEntries270102 : stickerEntries269079;
+    const size_t stickerCount = build270102 ? sizeof(stickerEntries270102) / sizeof(stickerEntries270102[0])
+                                            : sizeof(stickerEntries269079) / sizeof(stickerEntries269079[0]);
+    const Entry *saveEntries = build270102 ? saveEntries270102 : saveEntries269079;
+    const size_t saveCount = build270102 ? sizeof(saveEntries270102) / sizeof(saveEntries270102[0])
+                                         : sizeof(saveEntries269079) / sizeof(saveEntries269079[0]);
+    auto matches = [](const Entry *checks, size_t count) {
+        for (size_t index = 0; index < count; index++) {
+            const Entry &entry = checks[index];
             if (memcmp((void *)YMRuntimeAddress(entry.offset), entry.bytes, sizeof(entry.bytes)) != 0) {
                 YMLog(@"[MessageMedia] ABI mismatch at 0x%lx; keep +1", entry.offset);
                 return false;
@@ -490,10 +605,10 @@ void YMMessageMediaActions::validateABI() {
         }
         return true;
     };
-    const bool pathsReady = matches(pathEntries);
-    YMImageLookupReady = pathsReady && matches(imageEntries);
-    YMStickerLookupReady = pathsReady && matches(stickerEntries);
-    YMStickerSaveReady = YMStickerLookupReady && matches(saveEntries);
+    const bool pathsReady = matches(pathEntries, pathCount);
+    YMImageLookupReady = pathsReady && matches(imageEntries, imageCount);
+    YMStickerLookupReady = pathsReady && matches(stickerEntries, stickerCount);
+    YMStickerSaveReady = YMStickerLookupReady && matches(saveEntries, saveCount);
     // 外部codec也核对自身入口，不能仅依赖wechat.dylib导入跳板的指纹。
     struct CodecEntry { const char *symbol; uint8_t bytes[16]; };
     static const CodecEntry codecEntries[] = {

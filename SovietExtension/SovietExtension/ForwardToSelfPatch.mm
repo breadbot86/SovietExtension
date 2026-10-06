@@ -314,8 +314,17 @@ static BOOL YMForwardViaSendMsgCGI(uintptr_t fn, NSString *selfId, NSString *con
 
 struct YMForwardMessageData {
     // 仅提供对齐存储。内部含 string/shared_ptr/容器，必须通过原生构造、转换和析构管理。
-    uintptr_t words[0x340 / sizeof(uintptr_t)];
+    // 269079 为 0x340；270102 为 0x350（中部字段 +8~+0x10，正文 0xb0→0xb8）。
+    // 统一按 0x350 分配，原生只触碰自身版本的前缀，多余尾部无害。
+    uintptr_t words[0x350 / sizeof(uintptr_t)];
 };
+
+// MessageData 布局按版本选择：正文 string 偏移 269079=0xb0 / 270102=0xb8。
+// 其余插件读写的偏移（type +8、收件人 +0x28/+0x40/+0x58、sourceID +0x90）两版一致。
+static size_t YMForwardMessageContentSizeOffset(void) {
+    NSString *build = [NSBundle mainBundle].infoDictionary[@"CFBundleVersion"];
+    return [build isEqualToString:@"270102"] ? 0xb8 : 0xb0;
+}
 
 struct YMForwardTargets {
     // 269079 原生上下文布局；key=2 是普通微信目标，另外两项保持为空。
@@ -406,11 +415,13 @@ static BOOL YMForwardNoticeToSelf(NSString *selfId, NSString *content) {
         memcpy(data + 8, &textType, sizeof(textType));
         // 269079: 48e0f90 初始化完整对象；484f234 / 5167ac 确认正文为 +0xb0 的 string。
         // 27ac014 为发送生成新 Wrap/身份；27c1058..27c106c 将 Data+0xb0 赋给 Wrap+0x130。
+        // 270102: 正文 string 头移到 +0xb7（数据 +0xb8），其余收件人/类型/ID 偏移不变。
         // 新通知不借用原消息的 ID、扩展对象或媒体字段，也不按 ID 重查原文。
         *(std::string *)(data + 0x28) = recipientUTF8;
         *(std::string *)(data + 0x40) = recipientUTF8;
         *(std::string *)(data + 0x58) = recipientUTF8;
-        ((std::string *)(data + 0xb0))->assign(contentUTF8, [content lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+        ((std::string *)(data + YMForwardMessageContentSizeOffset()))->assign(
+            contentUTF8, [content lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
         return YMSubmitMessageToSession(message.get(), selfId, addresses);
     } catch (...) {
         YMForwardLog(@"native notice construction failed");

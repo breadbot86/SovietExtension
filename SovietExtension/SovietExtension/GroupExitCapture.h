@@ -4,6 +4,32 @@
 // Included by RevokePatch.mm: verified arm64 Build 269079 only.
 // Capture before replacement, confirm BOTH member DB and room future, then notify.
 // No Frida dependency, no restore/repatch calls, no private calls on the DB worker.
+// ---- 每构建捕获 ABI（269079 / 270102）----
+// 270102 协程入口 0x28C0B34（与 DBApply 0x2A30E40 同指纹克隆）；帧 -0x60-0xC00，
+// room 副本 sp+0xE0、结果点栈槽 sp+0x248；槽位 0x9C0E260 唯一 rebase 指向新 DBApply。
+// response 结构 +0x10/+0x20/+0x24/+0x30/+0x38 已按新版指令验证不变；
+// room 结构 +8/+0x58/+0x60/+0x7c/+0xd8 依赖运行时交叉校验兜底（模板拷贝块逐指令一致）。
+struct YMGroupExitCaptureABI {
+    uintptr_t entryVA, resultVA, slotVA;
+    uintptr_t entryAfterVA, resultAfterVA, resultZeroVA;
+    size_t frameKeyOffset;   // 结果点 SP + K = 入口 SP（269079=0xCC0 / 270102=0xC60）
+    size_t roomFrameOffset;  // 入口 SP 上方的 room 副本（0x140 / 0xE0）
+};
+static const YMGroupExitCaptureABI &GXC(void) {
+    static const YMGroupExitCaptureABI k269079 = {
+        0x213AB2C, 0x213C83C, 0x8CEF178,
+        0x213AB3C, 0x213C84C, 0x213C858,
+        0xCC0, 0x140,
+    };
+    static const YMGroupExitCaptureABI k270102 = {
+        0x28C0B34, 0x28C2730, 0x9C0E260,
+        0x28C0B44, 0x28C2740, 0x28C274C,
+        0xC60, 0xE0,
+    };
+    NSString *build = [NSBundle mainBundle].infoDictionary[@"CFBundleVersion"];
+    return [build isEqualToString:@"270102"] ? k270102 : k269079;
+}
+
 struct YMGroupExitResponse {
     uint64_t nonce = 0, generation = 0;
     YMGroupExitAccount account;
@@ -147,14 +173,14 @@ extern "C" void YMGroupExitCompleteResponse(uintptr_t nativeSP, bool success) no
             std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
             auto account = YMGroupExitCheckAccount();
             auto &pending = YMGroupExitResponses();
-            auto found = pending.find(nativeSP + 0xcc0);
+            auto found = pending.find(nativeSP + GXC().frameKeyOffset);
             if (found == pending.end()) return;
             auto item = std::move(found->second);
             pending.erase(found);
             if (!YMGroupExitCaptureReady.load() || !success || !item.applied || !YMIsGroupExitMonitorEnabled() ||
                 item.generation != YMGroupExitGeneration.load() || !(item.account == account)) return;
             uint32_t version = 0; uint64_t count = 0;
-            const uintptr_t room = nativeSP + 0x140;
+            const uintptr_t room = nativeSP + GXC().roomFrameOffset;
             if (!YMSafeReadMemory(room + 0x7c, &version, 4) || version != item.version ||
                 !YMSafeReadMemory(room + 0xd8, &count, 8) || count != item.after.count ||
                 ![item.room isEqualToString:YMNSStringFromLibcppStringObject((void *)(room + 8), 128)] ||
@@ -329,11 +355,35 @@ __asm__(
     "ldr x16, [x16, _YMExitResultZero@PAGEOFF]\n"
     "br x16\n"
 );
+extern "C" void YMExitResultBridgeV15(void);
+__asm__(
+    ".text\n"
+    ".align 2\n"
+    ".globl _YMExitResultBridgeV15\n"
+    "_YMExitResultBridgeV15:\n"
+    "YMExitSave\n"
+    "ldrb w1, [x0]\n"
+    "and w1, w1, #1\n"
+    "add x0, sp, #0x310\n"
+    "bl _YMGroupExitCompleteResponse\n"
+    "YMExitRestore\n"
+    "ldrb w19, [x0]\n"
+    "ldr x23, [sp, #0x248]\n"   /* 270102 结果点栈槽 */
+    "cbz x23, 1f\n"
+    "add x8, x23, #8\n"
+    "adrp x16, _YMExitResultAfter@PAGE\n"
+    "ldr x16, [x16, _YMExitResultAfter@PAGEOFF]\n"
+    "br x16\n"
+    "1:\n"
+    "adrp x16, _YMExitResultZero@PAGE\n"
+    "ldr x16, [x16, _YMExitResultZero@PAGEOFF]\n"
+    "br x16\n"
+);
 #endif
 static BOOL YMGroupExitWriteCodeBytes(uintptr_t, const uint8_t *, size_t, const char *, const char *);
 // The task vtable is DYLD_CHAINED_PTR_64_OFFSET (not authenticated). Keep its protection.
 static bool YMGroupExitWriteDBSlot(uintptr_t value) {
-    vm_address_t address = YMRuntimeAddress(0x8CEF178), region = address;
+    vm_address_t address = YMRuntimeAddress(GXC().slotVA), region = address;
     vm_size_t size = 0;
     vm_region_basic_info_data_64_t info{};
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
@@ -350,25 +400,34 @@ static BOOL YMGroupExitInstallCapture(void) {
 #if defined(__aarch64__)
     if (YMHasPatchedGroupExitMonitor) return YES;
     if (!YMGroupExitCaptureABIReady()) return NO;
+    const YMGroupExitCaptureABI &gxc = GXC();
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    const BOOL build270102 = profile && strcmp(profile->buildVersion, "270102") == 0;
+    const uintptr_t dbApplyVA = profile ? profile->groupExitDBApplyVA : 0;
     static const uint8_t entry[16] = {0xfc,0x6f,0xba,0xa9,0xfa,0x67,0x01,0xa9,0xf8,0x5f,0x02,0xa9,0xf6,0x57,0x03,0xa9};
-    static const uint8_t result[16] = {0x13,0x00,0x40,0x39,0xf7,0x57,0x41,0xf9,0xb7,0x00,0x00,0xb4,0xe8,0x22,0x00,0x91};
+    // 结果点指纹仅第 3 字节（栈槽立即数）随构建不同：269079=0x57(sp+0x2a8) / 270102=0x27(sp+0x248)。
+    static const uint8_t result269079[16] = {0x13,0x00,0x40,0x39,0xf7,0x57,0x41,0xf9,0xb7,0x00,0x00,0xb4,0xe8,0x22,0x00,0x91};
+    static const uint8_t result270102[16] = {0x13,0x00,0x40,0x39,0xf7,0x27,0x41,0xf9,0xb7,0x00,0x00,0xb4,0xe8,0x22,0x00,0x91};
+    const uint8_t *result = build270102 ? result270102 : result269079;
     uint8_t bytes[16]; uintptr_t slot = 0;
-    if (!YMSafeReadMemory(YMRuntimeAddress(0x213AB2C), bytes, 16) || memcmp(bytes, entry, 16) ||
-        !YMSafeReadMemory(YMRuntimeAddress(0x213C83C), bytes, 16) || memcmp(bytes, result, 16) ||
-        !YMSafeReadMemory(YMRuntimeAddress(0x2291064), bytes, 16) || memcmp(bytes, entry, 16) ||
-        !YMSafeReadPointer(YMRuntimeAddress(0x8CEF178), &slot) || slot != YMRuntimeAddress(0x2291064)) return NO;
-    YMExitEntryAfter = YMRuntimeAddress(0x213AB3C);
-    YMExitResultAfter = YMRuntimeAddress(0x213C84C);
-    YMExitResultZero = YMRuntimeAddress(0x213C858);
+    if (!dbApplyVA ||
+        !YMSafeReadMemory(YMRuntimeAddress(gxc.entryVA), bytes, 16) || memcmp(bytes, entry, 16) ||
+        !YMSafeReadMemory(YMRuntimeAddress(gxc.resultVA), bytes, 16) || memcmp(bytes, result, 16) ||
+        !YMSafeReadMemory(YMRuntimeAddress(dbApplyVA), bytes, 16) || memcmp(bytes, entry, 16) ||
+        !YMSafeReadPointer(YMRuntimeAddress(gxc.slotVA), &slot) || slot != YMRuntimeAddress(dbApplyVA)) return NO;
+    YMExitEntryAfter = YMRuntimeAddress(gxc.entryAfterVA);
+    YMExitResultAfter = YMRuntimeAddress(gxc.resultAfterVA);
+    YMExitResultZero = YMRuntimeAddress(gxc.resultZeroVA);
     YMGroupExitOriginalMemberDB = (YMGroupExitMemberDB)slot;
+    const uintptr_t resultBridge = build270102 ? (uintptr_t)&YMExitResultBridgeV15 : (uintptr_t)&YMExitResultBridge;
     bool installed = YMGroupExitWriteDBSlot((uintptr_t)&YMGroupExitConfirmMemberDB) &&
-        YMPatchARM64AbsoluteJump(YMRuntimeAddress(0x213C83C), (uintptr_t)&YMExitResultBridge, "member response result") &&
-        YMPatchARM64AbsoluteJump(YMRuntimeAddress(0x213AB2C), (uintptr_t)&YMExitEntryBridge, "member response capture");
+        YMPatchARM64AbsoluteJump(YMRuntimeAddress(gxc.resultVA), resultBridge, "member response result") &&
+        YMPatchARM64AbsoluteJump(YMRuntimeAddress(gxc.entryVA), (uintptr_t)&YMExitEntryBridge, "member response capture");
     if (!installed) {
         YMGroupExitCaptureReady.store(false);
         // All bridges retain valid continuations even if protection restoration fails.
-        bool restoredEntry = YMGroupExitWriteCodeBytes(YMRuntimeAddress(0x213AB2C), entry, 16, "member response", "rollback");
-        bool restoredResult = YMGroupExitWriteCodeBytes(YMRuntimeAddress(0x213C83C), result, 16, "member response result", "rollback");
+        bool restoredEntry = YMGroupExitWriteCodeBytes(YMRuntimeAddress(gxc.entryVA), entry, 16, "member response", "rollback");
+        bool restoredResult = YMGroupExitWriteCodeBytes(YMRuntimeAddress(gxc.resultVA), result, 16, "member response result", "rollback");
         bool restoredSlot = YMGroupExitWriteDBSlot(slot);
         YMLog(@"[GroupExitMonitor] capture installation failed; rollback=%@; monitoring unavailable",
               restoredEntry && restoredResult && restoredSlot ? @"OK" : @"FAILED");

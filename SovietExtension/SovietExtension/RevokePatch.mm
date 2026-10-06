@@ -3043,8 +3043,10 @@ using YMGroupExitShared = std::shared_ptr<void>;
 using YMGroupExitGetter = YMGroupExitShared (*)(void *);
 static const GX::SourceLocation YMGroupExitLocation = {"GroupExitMonitor", "RevokePatch.mm", __LINE__, 0, nullptr};
 static BOOL YMGroupExitUsesResponseCapture(void) {
+    // 269079 与 270102 都有成员响应捕获的原生适配。
     const auto *profile = YMGetActiveProfile();
-    return profile && strcmp(profile->buildVersion, "269079") == 0;
+    return profile && (strcmp(profile->buildVersion, "269079") == 0 ||
+                       strcmp(profile->buildVersion, "270102") == 0);
 }
 struct YMGroupExitABICheck { uintptr_t address; uint8_t bytes[16]; };
 

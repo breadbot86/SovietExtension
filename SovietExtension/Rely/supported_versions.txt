@@ -28,4 +28,4 @@
 
 4.1.10.53|4.1.10|268853|Tested on Mac WeChat 4.1.10.53
 4.1.11.23|4.1.11|269079|Tested on Mac WeChat 4.1.11.23
-4.1.15|4.1.15|270102|Tested on Mac WeChat 4.1.15 (arm64 UUID 3B7B6ABB)
+4.1.15.22|4.1.15|270102|Tested on Mac WeChat 4.1.15.22 (arm64 UUID 3B7B6ABB)

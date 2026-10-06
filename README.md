@@ -65,7 +65,7 @@
 
 | 微信版本      | Build 号 | Apple Silicon / M 芯片 | Intel | 下载地址                                                                        | 说明                       |
 | --------- | ------: | :------------------: | :---: | --------------------------------------------------------------------------- | ------------------------ |
-| 4.1.15.22 |  270102 |         ✅ 支持         | ❌ 不支持 | [Github 归档](https://github.com/zsbai/wechat-versions/releases/tag/4.1.15.22)           | 撤回拦截（含原消息类型/内容）、撤回同步转发、消息菜单 +1/访达定位/另存为、多开、防更新、退群监控（基线模式）均已适配；侧边栏入口管理、本人防撤回（保留重新编辑）暂不适用 |
+| 4.1.15.22 |  270102 |         ✅ 支持         | ❌ 不支持 | [Github 归档](https://github.com/zsbai/wechat-versions/releases/tag/4.1.15.22)           | 撤回拦截（含原消息类型/内容）、本人防撤回（保留重新编辑）、撤回同步转发、消息菜单 +1/访达定位/另存为、多开、防更新、侧边栏入口管理、退群监控均已适配 |
 | 4.1.11.23 |  269079 |         ✅ 支持         | ❌ 不支持 | [Github 归档](https://github.com/zsbai/wechat-versions/releases/tag/4.1.11.23)           | [1.1.2](https://github.com/MustangYM/SovietExtension/releases/tag/1.1.2) 已测试 |
 | 4.1.10.53 |  268853 |         ✅ 支持         | ❌ 不支持 | [微信官网](https://weixin.qq.com/updates?platform=mac&version=4.1.10)           | 截止 2026-06-19，我在官网下载到的版本 |
 

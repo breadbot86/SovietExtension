@@ -4378,7 +4378,7 @@ uint64_t YMRetainedSelfRevokeOriginalID(uintptr_t systemWrap) {
         !YMSafeReadMemory(systemWrap + 0xF8, &serverID, sizeof(serverID)) || serverID != 0 ||
         !YMSafeReadMemory(systemWrap + 0xF4, &localID, sizeof(localID)) || !localID ||
         !YMSafeReadMemory(systemWrap + 0x0C, &type, sizeof(type)) || type != 10000 ||
-        !YMSafeReadPointer(systemWrap + 0x210, &ext) || !ext ||
+        !YMSafeReadPointer(systemWrap + ((YMGetActiveProfile() && strcmp(YMGetActiveProfile()->buildVersion, "270102") == 0) ? 0x220 : 0x210), &ext) || !ext ||
         ![YMNSStringFromLibcppStringObject((void *)(ext + 0x148)) isEqualToString:@"revokemsg"]) return 0;
     // 原生重建提示 XML 不包含原消息 ID；以持久化提示身份关联，不能读 ext+0x168。
     return YMSelfRevokeOriginalID(NSUserDefaults.standardUserDefaults, YMSelfRevokeAccount(),
@@ -4389,9 +4389,14 @@ bool YMIsSelfRevokeNotice(uintptr_t systemWrap) {
     return YMRetainedSelfRevokeOriginalID(systemWrap) != 0;
 }
 
+static inline BOOL YMSelfRevokeSupportedBuild(const YMWeChatAdaptProfile *profile) {
+    // 269079 与 270102 都有本人防撤回的原生适配。
+    return profile && (strcmp(profile->buildVersion, "269079") == 0 ||
+                       strcmp(profile->buildVersion, "270102") == 0);
+}
 BOOL YMIsRetainedSelfMessage(uintptr_t messageData) {
     const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
-    if (!messageData || !profile || strcmp(profile->buildVersion, "269079") != 0) return NO;
+    if (!messageData || !YMSelfRevokeSupportedBuild(profile)) return NO;
     uint64_t serverID = 0;
     uint32_t localID = 0;
     if (!YMSafeReadMemory(messageData + 0x90, &serverID, sizeof(serverID)) ||
@@ -4407,7 +4412,7 @@ BOOL YMIsRetainedSelfMessage(uintptr_t messageData) {
 extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t savedRegs) {
     @autoreleasepool {
         const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
-        const BOOL supportedSelf = profile && strcmp(profile->buildVersion, "269079") == 0;
+        const BOOL supportedSelf = YMSelfRevokeSupportedBuild(profile);
         const YMRevokeSettings policy = YMReadRevokeSettings(NSUserDefaults.standardUserDefaults);
         if (!(supportedSelf ? policy.enabled : YMIsAntiRevokeEnabled())) {
             YMRevokeDeleteGuardActive = NO;
@@ -4856,7 +4861,7 @@ static BOOL YMPatchRevokeLocalCallsiteOnly(uintptr_t slide, NSString *source) {
         return NO;
     }
 
-    const BOOL nativeSelf = strcmp(profile->buildVersion, "269079") == 0;
+    const BOOL nativeSelf = YMSelfRevokeSupportedBuild(profile);
     if (nativeSelf) return YMInstallSelfRevokePatch();
 
     uintptr_t callsite = slide + profile->revokeOriginCallsiteAfterQueryVA;
@@ -5641,9 +5646,9 @@ YMFeatureApplyResult YMApplyFeatureSetting(NSString *key, BOOL enabled) {
     }
     const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
     if ([key isEqualToString:kRevokeEnabled] || [key isEqualToString:kSelfAntiRevoke] ||
-        ([key isEqualToString:kAntiRevoke] && profile && strcmp(profile->buildVersion, "269079") == 0)) {
+        ([key isEqualToString:kAntiRevoke] && YMSelfRevokeSupportedBuild(profile))) {
         // 本人适配的 Hook 启动时安装，开关只控制后续事件，不从菜单写代码页。
-        if (!profile || strcmp(profile->buildVersion, "269079") != 0) return YMFeatureUnavailable;
+        if (!YMSelfRevokeSupportedBuild(profile)) return YMFeatureUnavailable;
         return enabled && !YMHasPatchedAntiRevoke ? YMFeatureNeedsRestart : YMFeatureApplied;
     }
     if ([key isEqualToString:kAntiRevoke]) {

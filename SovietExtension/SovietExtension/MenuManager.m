@@ -79,7 +79,7 @@ static void YMProtectAssistantMenuRole(void) {
                                                               key:kAntiUpdate
                                                            action:@selector(onAntiUpdate:)];
     
-    BOOL separateRevoke = [[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"269079"];
+    BOOL separateRevoke = [@[@"269079", @"270102"] containsObject:[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"]];
     NSMenu *revokeGroupSub = [[NSMenu alloc] initWithTitle:@"消息撤回"];
     [revokeGroupSub addItem:[self ym_toggleMenuItemWithTitle:@"消息防撤回"
         key:separateRevoke ? kRevokeEnabled : kAntiRevoke action:@selector(onRevokeEnabled:)]];
@@ -142,6 +142,7 @@ static void YMProtectAssistantMenuRole(void) {
                                                        target:self
                                                 keyEquivalent:@""
                                                         state:NO];
+
     
     NSMenuItem *themeMenu = [self ym_createThemeModeMenu];
     NSMenuItem *sidebarMenu = [self ym_createSidebarMenu];
@@ -199,7 +200,7 @@ static void YMProtectAssistantMenuRole(void) {
 
 - (void)onRevokeEnabled:(NSMenuItem *)item
 {
-    if (![[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"269079"]) {
+    if (![@[@"269079", @"270102"] containsObject:[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"]]) {
         [self onAntiRevoke:item];
         return;
     }
@@ -265,6 +266,7 @@ static void YMProtectAssistantMenuRole(void) {
 {
     [self executeShellCommand:@"open -n /Applications/WeChat.app"];
 }
+
 
 - (void)onMistyMode:(NSMenuItem *)item
 {
@@ -411,7 +413,7 @@ static void YMProtectAssistantMenuRole(void) {
     
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setBool:enabled forKey:key];
-    if ([[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"269079"]) {
+    if ([@[@"269079", @"270102"] containsObject:[NSBundle mainBundle].infoDictionary[@"CFBundleVersion"]]) {
         for (NSArray<NSString *> *group in @[@[kRevokeEnabled, kAntiRevoke, kSelfAntiRevoke],
                                             @[kRevokeForwardToSelfRealSend, kRevokeForwardOthers, kRevokeForwardSelf]]) {
             if (![group containsObject:key]) continue;

@@ -53,8 +53,15 @@ static NSString *const YMNavigationSidebarSecondaryOrderKey = @"secondaryOrder";
 static NSString *const YMNavigationSidebarExposeSecondaryKey =
     @"exposeSecondaryEntries";
 
-static const YMNavigationSidebarBuildProfile &YMNavigationSidebarProfile =
-    YMNavigationSidebarWeChat411BuildProfile;
+// 当前构建匹配的 sidebar 补丁 profile（4.1.11 / 4.1.15 双样本）。
+static const YMNavigationSidebarBuildProfile &YMNavigationSidebarActiveProfileRef() {
+    return YMNavigationSidebarActiveProfile();
+}
+
+// 当前构建的 owner 布局（主/副控制器、溢出表、折叠模式字节、可见性标志组）。
+static inline const YMNavigationSidebarOwnerLayout &YMNavSbLayout() {
+    return YMNavigationSidebarOwnerLayoutFor(YMNavigationSidebarActiveProfile());
+}
 
 using YMNavigationSidebarOwnerFunction = void (*)(void *);
 using YMNavigationSidebarMainWindowDestructor = void *(*)(void *);
@@ -816,7 +823,7 @@ static bool YMNavigationSidebarLoadedImageUUIDMatches(
     return YMNavigationSidebarRangeHasProtection(
                address, imageHeaderSize, VM_PROT_READ) &&
            YMNavigationSidebarVerifyMachOUUID(
-               YMNavigationSidebarProfile,
+               YMNavigationSidebarActiveProfile(),
                reinterpret_cast<const std::uint8_t *>(header),
                imageHeaderSize);
 }
@@ -952,7 +959,7 @@ YMNavigationSidebarPreparePrimaryVisibility(
     plan.owner = owner;
     if (!YMNavigationSidebarLoadPointerMember(
             owner,
-            kYMNavigationSidebarPrimaryControllerOffset,
+            YMNavSbLayout().primaryController,
             plan.controller)) {
         return YMNavigationSidebarPrimaryPrepareFailure::unavailable;
     }
@@ -1052,7 +1059,7 @@ static void YMNavigationSidebarApplyDiscoverEntryVisibility(
 
     void *controller = nullptr;
     if (!YMNavigationSidebarLoadPointerMember(
-            owner, kYMNavigationSidebarPrimaryControllerOffset, controller) ||
+            owner, YMNavSbLayout().primaryController, controller) ||
         controller == nullptr) {
         return;
     }
@@ -1201,7 +1208,7 @@ static bool YMNavigationSidebarApplySecondaryProjection(
     void *controller = nullptr;
     if (!YMNavigationSidebarLoadPointerMember(
             owner,
-            kYMNavigationSidebarSecondaryControllerOffset,
+            YMNavSbLayout().secondaryController,
             controller)) {
         return false;
     }
@@ -1247,11 +1254,11 @@ static bool YMNavigationSidebarApplySecondaryProjection(
     const std::uintptr_t ownerAddress =
         reinterpret_cast<std::uintptr_t>(owner);
     if (ownerAddress > std::numeric_limits<std::uintptr_t>::max() -
-                           kYMNavigationSidebarOverflowOffset) {
+                           YMNavSbLayout().overflow) {
         return false;
     }
     callbacks.overflowHolder = reinterpret_cast<void *>(
-        ownerAddress + kYMNavigationSidebarOverflowOffset);
+        ownerAddress + YMNavSbLayout().overflow);
     if (!YMNavigationSidebarRangeHasProtection(
             reinterpret_cast<std::uintptr_t>(callbacks.overflowHolder),
             adapter::kHolderSlotsOffset,
@@ -1339,7 +1346,7 @@ struct YMNavigationSidebarLayoutScope {
                 const int type =
                     kYMNavigationSidebarSecondarySortableTypes[index];
                 auto *flag = static_cast<std::uint8_t *>(owner) +
-                             YMNavigationSidebarAvailabilityFlagOffset(type);
+                             YMNavigationSidebarAvailabilityFlagOffsetFor(YMNavigationSidebarActiveProfileRef(), type);
                 *flag = saved[index];
             }
         }
@@ -1369,7 +1376,7 @@ static void YMNavigationSidebarRearmSecondaryAvailability(void *owner) noexcept 
     const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(owner);
     for (const int type : kYMNavigationSidebarSecondarySortableTypes) {
         const std::uintptr_t offset =
-            YMNavigationSidebarAvailabilityFlagOffset(type);
+            YMNavigationSidebarAvailabilityFlagOffsetFor(YMNavigationSidebarActiveProfileRef(), type);
         if (offset == 0 ||
             base > std::numeric_limits<std::uintptr_t>::max() - offset) {
             continue;
@@ -1437,7 +1444,7 @@ static bool YMNavigationSidebarRunResponsiveLayout(void *owner) {
          ++index) {
         const int type = kYMNavigationSidebarSecondarySortableTypes[index];
         const std::uintptr_t offset =
-            YMNavigationSidebarAvailabilityFlagOffset(type);
+            YMNavigationSidebarAvailabilityFlagOffsetFor(YMNavigationSidebarActiveProfileRef(), type);
         const std::uintptr_t address =
             reinterpret_cast<std::uintptr_t>(owner) + offset;
         if (offset == 0 ||
@@ -1510,11 +1517,11 @@ static bool YMNavigationSidebarForceExpandedLayout(void *owner) noexcept {
     }
     const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(owner);
     if (base > std::numeric_limits<std::uintptr_t>::max() -
-                   kYMNavigationSidebarLayoutModeOffset) {
+                   YMNavSbLayout().layoutMode) {
         return false;
     }
     const std::uintptr_t modeAddress =
-        base + kYMNavigationSidebarLayoutModeOffset;
+        base + YMNavSbLayout().layoutMode;
     if (!YMNavigationSidebarRangeHasProtection(
             modeAddress, sizeof(std::uint8_t),
             VM_PROT_READ | VM_PROT_WRITE)) {
@@ -1535,7 +1542,7 @@ static bool YMNavigationSidebarForceExpandedLayout(void *owner) noexcept {
     for (std::size_t index = 0; index < kSecondaryCount; ++index) {
         const int type = kYMNavigationSidebarSecondarySortableTypes[index];
         const std::uintptr_t offset =
-            YMNavigationSidebarAvailabilityFlagOffset(type);
+            YMNavigationSidebarAvailabilityFlagOffsetFor(YMNavigationSidebarActiveProfileRef(), type);
         if (offset == 0 ||
             base > std::numeric_limits<std::uintptr_t>::max() - offset) {
             return false;
@@ -1692,8 +1699,13 @@ static void *YMNavigationSidebarDidDestroyMainWindow(void *mainWindow) {
         .revokeAtDestructorStart(
             reinterpret_cast<std::uint64_t>(mainWindow));
 
+    // 269079：owner 固定在窗口 +0x2A0。
+    // 270102：窗口布局重排后未重新定位于单一槽位；在窗口前部扫描与当前
+    // 捕获 owner 相等的指针槽，命中才清绑定，扫描失败保持现状（安全降级）。
     void *destroyedOwner = nullptr;
-    if (mainWindow != nullptr &&
+    const bool build270102 =
+        std::strcmp(YMNavigationSidebarActiveProfile().buildVersion, "270102") == 0;
+    if (mainWindow != nullptr && !build270102 &&
         YMNavigationSidebarRangeHasProtection(
             reinterpret_cast<std::uintptr_t>(mainWindow) + 0x2A0,
             sizeof(destroyedOwner),
@@ -1701,6 +1713,25 @@ static void *YMNavigationSidebarDidDestroyMainWindow(void *mainWindow) {
         std::memcpy(&destroyedOwner,
                     static_cast<std::uint8_t *>(mainWindow) + 0x2A0,
                     sizeof(destroyedOwner));
+    } else if (mainWindow != nullptr && build270102) {
+        void *captured = YMNavigationSidebarOwner.load(std::memory_order_acquire);
+        if (captured != nullptr) {
+            for (std::uintptr_t offset = 0x100; offset <= 0x400; offset += sizeof(void *)) {
+                void *slot = nullptr;
+                if (YMNavigationSidebarRangeHasProtection(
+                        reinterpret_cast<std::uintptr_t>(mainWindow) + offset,
+                        sizeof(slot),
+                        VM_PROT_READ)) {
+                    std::memcpy(&slot,
+                                static_cast<std::uint8_t *>(mainWindow) + offset,
+                                sizeof(slot));
+                    if (slot == captured) {
+                        destroyedOwner = slot;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     void *expected = destroyedOwner;
@@ -2084,11 +2115,11 @@ static bool YMNavigationSidebarAcquireQuiescence(void *rawContext) noexcept {
     const bool profileMatches =
         context.diagnosticOnly
             ? YMNavigationSidebarVerifyProfileBytes(
-                  YMNavigationSidebarProfile,
+                  YMNavigationSidebarActiveProfile(),
                   &YMNavigationSidebarReadRuntimeProfileBytes,
                   &context)
             : YMNavigationSidebarVerifyProfileBytesAndPublish(
-                  YMNavigationSidebarProfile,
+                  YMNavigationSidebarActiveProfile(),
                   &YMNavigationSidebarReadRuntimeProfileBytes,
                   &context,
                   &YMNavigationSidebarPublishVerifiedCallTargets,
@@ -2280,92 +2311,92 @@ static YMNavigationSidebarPatchContext YMNavigationSidebarBuildPatchContext(
     context.slide = slide;
     context.header = header;
     context.stages = {{
-        {address(YMNavigationSidebarProfile.responsiveLayoutVA),
-         YMNavigationSidebarProfile.expectedResponsiveLayoutBytes,
+        {address(YMNavigationSidebarActiveProfile().responsiveLayoutVA),
+         YMNavigationSidebarActiveProfile().expectedResponsiveLayoutBytes,
          reinterpret_cast<std::uintptr_t>(
              &YMNavigationSidebarDidUpdateResponsiveLayout),
          &YMNavigationSidebarResponsiveLayoutTrampoline},
-        {address(YMNavigationSidebarProfile.populateSecondaryEntriesVA),
-         YMNavigationSidebarProfile.expectedPopulateSecondaryEntriesBytes,
+        {address(YMNavigationSidebarActiveProfile().populateSecondaryEntriesVA),
+         YMNavigationSidebarActiveProfile().expectedPopulateSecondaryEntriesBytes,
          reinterpret_cast<std::uintptr_t>(
              &YMNavigationSidebarDidPopulateEntries),
          &YMNavigationSidebarPopulateEntriesTrampoline},
-        {address(YMNavigationSidebarProfile.mainWindowDestructorVA),
-         YMNavigationSidebarProfile.expectedMainWindowDestructorBytes,
+        {address(YMNavigationSidebarActiveProfile().mainWindowDestructorVA),
+         YMNavigationSidebarActiveProfile().expectedMainWindowDestructorBytes,
          reinterpret_cast<std::uintptr_t>(
              &YMNavigationSidebarDidDestroyMainWindow),
          &YMNavigationSidebarDestructorTrampoline},
-        {address(YMNavigationSidebarProfile.primaryOrderGetterVA),
-         YMNavigationSidebarProfile.expectedPrimaryOrderGetterBytes,
+        {address(YMNavigationSidebarActiveProfile().primaryOrderGetterVA),
+         YMNavigationSidebarActiveProfile().expectedPrimaryOrderGetterBytes,
          reinterpret_cast<std::uintptr_t>(
              &YMNavigationSidebarPrimaryOrderHook),
          &YMNavigationSidebarPrimaryOrderTrampoline},
-        {address(YMNavigationSidebarProfile.secondaryOrderGetterVA),
-         YMNavigationSidebarProfile.expectedSecondaryOrderGetterBytes,
+        {address(YMNavigationSidebarActiveProfile().secondaryOrderGetterVA),
+         YMNavigationSidebarActiveProfile().expectedSecondaryOrderGetterBytes,
          reinterpret_cast<std::uintptr_t>(
              &YMNavigationSidebarSecondaryOrderHook),
          &YMNavigationSidebarSecondaryOrderTrampoline},
-        {address(YMNavigationSidebarProfile.clickSelectionInvokerVA),
-         YMNavigationSidebarProfile.expectedClickSelectionInvokerBytes,
+        {address(YMNavigationSidebarActiveProfile().clickSelectionInvokerVA),
+         YMNavigationSidebarActiveProfile().expectedClickSelectionInvokerBytes,
          reinterpret_cast<std::uintptr_t>(
              &YMNavigationSidebarDidSetClickSelection),
          &YMNavigationSidebarClickSelectionTrampoline},
     }};
 
     context.calls = {
-        address(YMNavigationSidebarProfile.primarySelectorVA),
-        address(YMNavigationSidebarProfile.selectedPrimaryTypeGetterVA),
-        address(YMNavigationSidebarProfile.findSecondaryItemVA),
-        address(YMNavigationSidebarProfile.lookupItemVA),
-        address(YMNavigationSidebarProfile.overflowClearVA),
-        address(YMNavigationSidebarProfile.overflowAppendVA),
-        address(YMNavigationSidebarProfile.moreSetVisibleVA),
-        address(YMNavigationSidebarProfile.moreSetBadgeVA),
-        address(YMNavigationSidebarProfile.moreCountGetterVA),
-        address(YMNavigationSidebarProfile.nativeTitleFromUtf8VA),
-        address(YMNavigationSidebarProfile.moreTitleFormatGetterVA),
-        address(YMNavigationSidebarProfile.nativeTitleFormatterVA),
-        address(YMNavigationSidebarProfile.nativeTitleDeallocateVA),
-        address(YMNavigationSidebarProfile.moreTitleSetterVA),
-        address(YMNavigationSidebarProfile.postLayoutVA),
-        address(YMNavigationSidebarProfile.rowSelectVA),
-        address(YMNavigationSidebarProfile.rowDeselectVA),
+        address(YMNavigationSidebarActiveProfile().primarySelectorVA),
+        address(YMNavigationSidebarActiveProfile().selectedPrimaryTypeGetterVA),
+        address(YMNavigationSidebarActiveProfile().findSecondaryItemVA),
+        address(YMNavigationSidebarActiveProfile().lookupItemVA),
+        address(YMNavigationSidebarActiveProfile().overflowClearVA),
+        address(YMNavigationSidebarActiveProfile().overflowAppendVA),
+        address(YMNavigationSidebarActiveProfile().moreSetVisibleVA),
+        address(YMNavigationSidebarActiveProfile().moreSetBadgeVA),
+        address(YMNavigationSidebarActiveProfile().moreCountGetterVA),
+        address(YMNavigationSidebarActiveProfile().nativeTitleFromUtf8VA),
+        address(YMNavigationSidebarActiveProfile().moreTitleFormatGetterVA),
+        address(YMNavigationSidebarActiveProfile().nativeTitleFormatterVA),
+        address(YMNavigationSidebarActiveProfile().nativeTitleDeallocateVA),
+        address(YMNavigationSidebarActiveProfile().moreTitleSetterVA),
+        address(YMNavigationSidebarActiveProfile().postLayoutVA),
+        address(YMNavigationSidebarActiveProfile().rowSelectVA),
+        address(YMNavigationSidebarActiveProfile().rowDeselectVA),
     };
     context.callGuards = {{
         {context.calls.primarySelector,
-         YMNavigationSidebarProfile.expectedPrimarySelectorBytes},
+         YMNavigationSidebarActiveProfile().expectedPrimarySelectorBytes},
         {context.calls.selectedPrimaryGetter,
-         YMNavigationSidebarProfile.expectedSelectedPrimaryTypeGetterBytes},
+         YMNavigationSidebarActiveProfile().expectedSelectedPrimaryTypeGetterBytes},
         {context.calls.findSecondaryItem,
-         YMNavigationSidebarProfile.expectedFindSecondaryItemBytes},
+         YMNavigationSidebarActiveProfile().expectedFindSecondaryItemBytes},
         {context.calls.lookupItem,
-         YMNavigationSidebarProfile.expectedLookupItemBytes},
+         YMNavigationSidebarActiveProfile().expectedLookupItemBytes},
         {context.calls.overflowClear,
-         YMNavigationSidebarProfile.expectedOverflowClearBytes},
+         YMNavigationSidebarActiveProfile().expectedOverflowClearBytes},
         {context.calls.overflowAppend,
-         YMNavigationSidebarProfile.expectedOverflowAppendBytes},
+         YMNavigationSidebarActiveProfile().expectedOverflowAppendBytes},
         {context.calls.moreSetVisible,
-         YMNavigationSidebarProfile.expectedMoreSetVisibleBytes},
+         YMNavigationSidebarActiveProfile().expectedMoreSetVisibleBytes},
         {context.calls.moreSetBadge,
-         YMNavigationSidebarProfile.expectedMoreSetBadgeBytes},
+         YMNavigationSidebarActiveProfile().expectedMoreSetBadgeBytes},
         {context.calls.moreCountGetter,
-         YMNavigationSidebarProfile.expectedMoreCountGetterBytes},
+         YMNavigationSidebarActiveProfile().expectedMoreCountGetterBytes},
         {context.calls.nativeTitleFromUtf8,
-         YMNavigationSidebarProfile.expectedNativeTitleFromUtf8Bytes},
+         YMNavigationSidebarActiveProfile().expectedNativeTitleFromUtf8Bytes},
         {context.calls.moreTitleFormatGetter,
-         YMNavigationSidebarProfile.expectedMoreTitleFormatGetterBytes},
+         YMNavigationSidebarActiveProfile().expectedMoreTitleFormatGetterBytes},
         {context.calls.nativeTitleFormatter,
-         YMNavigationSidebarProfile.expectedNativeTitleFormatterBytes},
+         YMNavigationSidebarActiveProfile().expectedNativeTitleFormatterBytes},
         {context.calls.nativeTitleDeallocate,
-         YMNavigationSidebarProfile.expectedNativeTitleDeallocateBytes},
+         YMNavigationSidebarActiveProfile().expectedNativeTitleDeallocateBytes},
         {context.calls.moreTitleSetter,
-         YMNavigationSidebarProfile.expectedMoreTitleSetterBytes},
+         YMNavigationSidebarActiveProfile().expectedMoreTitleSetterBytes},
         {context.calls.postLayout,
-         YMNavigationSidebarProfile.expectedPostLayoutBytes},
+         YMNavigationSidebarActiveProfile().expectedPostLayoutBytes},
         {context.calls.rowSelect,
-         YMNavigationSidebarProfile.expectedRowSelectBytes},
+         YMNavigationSidebarActiveProfile().expectedRowSelectBytes},
         {context.calls.rowDeselect,
-         YMNavigationSidebarProfile.expectedRowDeselectBytes},
+         YMNavigationSidebarActiveProfile().expectedRowDeselectBytes},
     }};
     return context;
 }
@@ -2381,13 +2412,13 @@ YMNavigationSidebarBuildDiagnosticPatchContext(
     std::uintptr_t target = 0;
     if (!YMNavigationSidebarAddSlide(
             slide,
-            YMNavigationSidebarProfile.secondaryActivationVA,
+            YMNavigationSidebarActiveProfile().secondaryActivationVA,
             target)) {
         return context;
     }
     context.stages[0] = {
         target,
-        YMNavigationSidebarProfile.expectedSecondaryActivationBytes,
+        YMNavigationSidebarActiveProfile().expectedSecondaryActivationBytes,
         reinterpret_cast<std::uintptr_t>(
             &YMNavigationSidebarSecondaryActivationHook),
         nullptr,
@@ -2410,7 +2441,7 @@ static BOOL YMNavigationSidebarCurrentBuildMatches(
         header != nullptr
             ? macho_arch_name_for_cpu_type(header->cputype, header->cpusubtype)
             : nullptr;
-    return YMNavigationSidebarProfileMatches(YMNavigationSidebarProfile,
+    return YMNavigationSidebarProfileMatches(YMNavigationSidebarActiveProfileRef(),
                                              bundleIdentifier.UTF8String,
                                              shortVersion.UTF8String,
                                              buildVersion.UTF8String,
@@ -3027,7 +3058,7 @@ static BOOL YMNavigationSidebarPerformSave(
             YMNavigationSidebarGetSelectedPrimary == nullptr ||
             !YMNavigationSidebarLoadPointerMember(
                 owner,
-                kYMNavigationSidebarPrimaryControllerOffset,
+                YMNavSbLayout().primaryController,
                 callbacks.controller)) {
             if (error != nullptr) {
                 *error = YMNavigationSidebarError(

@@ -313,6 +313,194 @@ static NSString *ym_text_from_bytes(const void *bytes, int length)
     return nil;
 }
 
+#pragma mark - V2 附件解码（msg/attach 下的 .dat）
+
+// 格式（实测 Mac 4.1.15 与 Windows 4.1 相同）：
+// [15B 头: 07 08 'V' '2' 08 07 | aes_size(LE32) | xor_size(LE32) | pad]
+// [AES-128-ECB+PKCS7 区段 aes_size 字节][明文区][单字节 XOR 尾区 xor_size 字节]
+// key = md5("<seed><wxid>") hex 前 16 个 ASCII 字符；XOR key = seed & 0xFF。
+// seed 为账号级 9~10 位数字，可对任意 .dat 强校验爆破（约 3 秒）。
+
+static NSString *ym_xwechat_files_root(void);
+
+// 目录名 wxid_xxx_1b1f → 用户名 wxid_xxx（附件密钥派生用无后缀形式）
+static NSString *ym_attach_username_for_account(NSString *account)
+{
+    if (![account hasPrefix:@"wxid_"]) return account;
+    NSArray *parts = [account componentsSeparatedByString:@"_"];
+    if (parts.count >= 3) {
+        return [[parts subarrayWithRange:NSMakeRange(0, parts.count - 1)]
+            componentsJoinedByString:@"_"];
+    }
+    return account;
+}
+
+static NSString *ym_attach_seed_cache_path(NSString *wxid)
+{
+    NSString *dir = [[YMKeyExportDirectory() stringByDeletingLastPathComponent]
+        stringByAppendingPathComponent:@"AttachSeeds"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:[wxid stringByAppendingString:@".seed"]];
+}
+
+static unsigned long long ym_attach_cached_seed(NSString *wxid)
+{
+    NSString *text = [NSString stringWithContentsOfFile:ym_attach_seed_cache_path(wxid)
+                                                encoding:NSUTF8StringEncoding error:nil];
+    unsigned long long seed = [text longLongValue];
+    return (seed >= 100000000ULL && seed <= 4000000000ULL) ? seed : 0;
+}
+
+static void ym_attach_store_seed(NSString *wxid, unsigned long long seed)
+{
+    [[NSString stringWithFormat:@"%llu", seed] writeToFile:ym_attach_seed_cache_path(wxid)
+        atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static NSData *ym_v2_decode(NSData *data, const unsigned char keyAscii[16], unsigned char xorKey)
+{
+    const unsigned char *bytes = (const unsigned char *)data.bytes;
+    if (data.length < 31) return nil;
+    BOOL isV1 = memcmp(bytes, "\x07\x08V1\x08\x07", 6) == 0;
+    if (!isV1 && memcmp(bytes, "\x07\x08V2\x08\x07", 6) != 0) return nil;
+    if (isV1) keyAscii = (const unsigned char *)"cfcd208495d565ef";  // V1 固定密钥
+    uint32_t aesSize = (uint32_t)bytes[6] | ((uint32_t)bytes[7] << 8) | ((uint32_t)bytes[8] << 16) | ((uint32_t)bytes[9] << 24);
+    uint32_t xorSize = (uint32_t)bytes[10] | ((uint32_t)bytes[11] << 8) | ((uint32_t)bytes[12] << 16) | ((uint32_t)bytes[13] << 24);
+    uint32_t alignedFull = aesSize % 16 ? aesSize + (16 - aesSize % 16) : aesSize + 16;
+    if ((uint64_t)15 + alignedFull + xorSize > data.length) return nil;
+
+    unsigned char *aesOut = (unsigned char *)malloc(alignedFull);
+    size_t moved = 0;
+    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0, keyAscii, 16, NULL,
+                                 bytes + 15, alignedFull, aesOut, alignedFull, &moved);
+    if (st != kCCSuccess || moved != alignedFull) { free(aesOut); return nil; }
+    uint32_t plainLen = alignedFull;
+    unsigned char pad = aesOut[alignedFull - 1];
+    if (pad >= 1 && pad <= 16) {
+        BOOL valid = YES;
+        for (uint32_t i = alignedFull - pad; i < alignedFull; i++) {
+            if (aesOut[i] != pad) { valid = NO; break; }
+        }
+        if (valid) plainLen = alignedFull - pad;
+    }
+    uint32_t rawLen = (uint32_t)(data.length - 15 - alignedFull - xorSize);
+    NSMutableData *out = [NSMutableData dataWithCapacity:plainLen + rawLen + xorSize];
+    [out appendBytes:aesOut length:plainLen];
+    free(aesOut);
+    [out appendBytes:bytes + 15 + alignedFull length:rawLen];
+    const unsigned char *xorSrc = bytes + data.length - xorSize;
+    for (uint32_t i = 0; i < xorSize; i++) {
+        unsigned char b = xorSrc[i] ^ xorKey;
+        [out appendBytes:&b length:1];
+    }
+    return out;
+}
+
+// 对已知 .dat 强校验：首块解出图片魔数 + 尾块合法 PKCS7（纯 AES 文件）
+static BOOL ym_v2_key_checks(const unsigned char keyAscii[16],
+                             const unsigned char *data, size_t n)
+{
+    if (n < 31) return NO;
+    BOOL isV1 = memcmp(data, "\x07\x08V1\x08\x07", 6) == 0;
+    if (!isV1 && memcmp(data, "\x07\x08V2\x08\x07", 6) != 0) return NO;
+    if (isV1) keyAscii = (const unsigned char *)"cfcd208495d565ef";
+    uint32_t aesSize = (uint32_t)data[6] | ((uint32_t)data[7] << 8) | ((uint32_t)data[8] << 16) | ((uint32_t)data[9] << 24);
+    uint32_t xorSize = (uint32_t)data[10] | ((uint32_t)data[11] << 8) | ((uint32_t)data[12] << 16) | ((uint32_t)data[13] << 24);
+    uint32_t aligned = aesSize % 16 ? aesSize + (16 - aesSize % 16) : aesSize + 16;
+    if ((uint64_t)15 + aligned > n) return NO;
+    unsigned char first[16], last[16];
+    size_t moved = 0;
+    if (CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0, keyAscii, 16, NULL, data + 15, 16, first, 16, &moved) != kCCSuccess) return NO;
+    BOOL magic = (first[0] == 0xFF && first[1] == 0xD8 && first[2] == 0xFF) ||
+                 (first[0] == 0x89 && first[1] == 0x50 && first[2] == 0x4E && first[3] == 0x47) ||
+                 (first[0] == 'G' && first[1] == 'I' && first[2] == 'F') ||
+                 (first[0] == 'R' && first[1] == 'I' && first[2] == 'F' && first[3] == 'F') ||
+                 (first[0] == 'w' && first[1] == 'x' && first[2] == 'g' && first[3] == 'f') ||
+                 (first[0] == 0x00 && first[1] == 0x00 && first[2] == 0x00 && (first[3] >= 0x14));
+    if (!magic) return NO;
+    if (xorSize == 0) {
+        if (CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0, keyAscii, 16, NULL, data + 15 + aligned - 16, 16, last, 16, &moved) != kCCSuccess) return NO;
+        unsigned char pad = last[15];
+        if (pad < 1 || pad > 16) return NO;
+        for (unsigned i = 16 - pad; i < 16; i++) if (last[i] != pad) return NO;
+    }
+    return YES;
+}
+
+// 用文件尾反推 XOR key（假设明文以 JPEG FFD9 收尾），多数投票
+static unsigned char ym_attach_xor_vote(NSString *account)
+{
+    NSString *root = ym_xwechat_files_root();
+    if (!root) return 0;
+    NSString *attachRoot = [[[root stringByAppendingPathComponent:account]
+        stringByAppendingPathComponent:@"msg"] stringByAppendingPathComponent:@"attach"];
+    NSCountedSet *votes = [NSCountedSet set];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDirectoryEnumerator *e = [fm enumeratorAtURL:[NSURL fileURLWithPath:attachRoot]
+                        includingPropertiesForKeys:@[NSURLFileSizeKey] options:0 errorHandler:nil];
+    int examined = 0;
+    for (NSURL *url in e) {
+        if (examined >= 60) break;
+        if (![url.pathExtension.lowercaseString isEqualToString:@"dat"]) continue;
+        NSFileHandle *fh = [NSFileHandle fileHandleForReadingFromURL:url error:nil];
+        [fh seekToEndOfFile];
+        unsigned long long size = [fh offsetInFile];
+        if (size < 64) { [fh closeFile]; continue; }
+        [fh seekToFileOffset:size - 2];
+        NSData *tail = [fh readDataToEndOfFile];
+        [fh closeFile];
+        if (tail.length == 2) {
+            unsigned char x = ((const unsigned char *)tail.bytes)[0] ^ 0xFF;
+            unsigned char y = ((const unsigned char *)tail.bytes)[1] ^ 0xD9;
+            if (x == y) [votes addObject:@(x)];
+        }
+        examined++;
+    }
+    unsigned char best = 0; NSUInteger bestCount = 0;
+    for (NSNumber *k in votes) {
+        if ([votes countForObject:k] > bestCount) {
+            bestCount = [votes countForObject:k];
+            best = (unsigned char)[k unsignedCharValue];
+        }
+    }
+    return best;
+}
+
+// 爆破 seed（约 1500 万次 md5+AES，数秒）；对多个样本同时强校验，误报率 ~2^-72。
+// 失败返回 0。paths/n 为样本文件（建议 3 个不同大小的 .dat）。
+static unsigned long long ym_attach_brute_seed(NSString * const *paths, NSUInteger count,
+                                               NSString *wxid, unsigned char xorKey)
+{
+    if (count == 0) return 0;
+    static unsigned char data[8][1 << 21];
+    size_t lens[8];
+    NSUInteger loaded = 0;
+    for (NSUInteger i = 0; i < count && loaded < 8; i++) {
+        FILE *f = fopen(paths[i].fileSystemRepresentation, "rb");
+        if (!f) continue;
+        lens[loaded] = fread(data[loaded], 1, 1 << 21, f);
+        fclose(f);
+        if (lens[loaded] >= 31) loaded++;
+    }
+    if (loaded == 0) return 0;
+    for (unsigned long long seed = 100000000ULL; seed <= 4000000000ULL; seed++) {
+        if ((seed & 0xFF) != xorKey) continue;
+        char buf[96];
+        int len = snprintf(buf, sizeof(buf), "%llu%s", seed, wxid.UTF8String);
+        unsigned char md5[16];
+        CC_MD5(buf, (CC_LONG)len, md5);
+        char hex[33];
+        for (int i = 0; i < 16; i++) sprintf(hex + i * 2, "%02x", md5[i]);
+        BOOL all = YES;
+        for (NSUInteger i = 0; i < loaded && all; i++) {
+            all = ym_v2_key_checks((const unsigned char *)hex, data[i], lens[i]);
+        }
+        if (all) return seed;
+    }
+    return 0;
+}
+
 static NSString *ym_quote_identifier(NSString *identifier)
 {
     return [identifier stringByReplacingOccurrencesOfString:@"\"" withString:@"\"\""];
@@ -428,6 +616,10 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 @property (nonatomic, weak) NSTextField *previewTitle;
 @property (nonatomic, weak) NSScrollView *previewScroll;
 @property (nonatomic, weak) NSTextView *previewText;
+@property (nonatomic, weak) NSImageView *previewImage;
+@property (nonatomic, assign) unsigned long long attachSeed;   // 0 = 未求出
+@property (nonatomic, assign) unsigned char attachXor;
+@property (nonatomic, assign) BOOL attachXorKnown;
 @property (nonatomic, assign) BOOL simpleMode;                      // YES=简易模式
 @property (nonatomic, strong) NSDictionary<NSString *, NSString *> *contactNames;  // username → 显示名
 @property (nonatomic, copy) NSString *selfUsername;
@@ -602,9 +794,26 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
         [previewScroll.trailingAnchor constraintEqualToAnchor:previewPane.trailingAnchor],
         [previewScroll.bottomAnchor constraintEqualToAnchor:previewPane.bottomAnchor],
     ]];
+    NSImageView *previewImage = [[NSImageView alloc] init];
+    previewImage.translatesAutoresizingMaskIntoConstraints = NO;
+    previewImage.imageScaling = NSImageScaleProportionallyUpOrDown;
+    previewImage.imageAlignment = NSImageAlignCenter;
+    previewImage.wantsLayer = YES;
+    previewImage.layer.borderColor = [NSColor separatorColor].CGColor;
+    previewImage.layer.borderWidth = 1.0;
+    previewImage.hidden = YES;
+    [previewPane addSubview:previewImage];
+    [NSLayoutConstraint activateConstraints:@[
+        [previewImage.topAnchor constraintEqualToAnchor:previewTitle.bottomAnchor constant:4],
+        [previewImage.leadingAnchor constraintEqualToAnchor:previewPane.leadingAnchor],
+        [previewImage.trailingAnchor constraintEqualToAnchor:previewPane.trailingAnchor],
+        [previewImage.heightAnchor constraintEqualToConstant:220],
+        [previewScroll.topAnchor constraintEqualToAnchor:previewImage.bottomAnchor constant:4],
+    ]];
     _previewTitle = previewTitle;
     _previewScroll = previewScroll;
     _previewText = previewText;
+    _previewImage = previewImage;
 
     [split addArrangedSubview:treeScroll];
     [split addArrangedSubview:rowsPane];
@@ -1251,6 +1460,98 @@ static NSString *ym_attach_info_for_row(const void *pi, int piLen,
                                         const void *mc, int mcLen,
                                         YMDbTreeNode *conversationNode);
 
+// 从 packed_info_data 提取附件 md5 → 定位 .dat → V2 解码（工作队列调用）
+- (NSData *)ym_decode_attachment:(const void *)pi piLen:(int)piLen
+{
+    YMDbTreeNode *node = self.currentNode;
+    if (!node || !node.database || !pi || piLen <= 0) return nil;
+    NSString *piText = [[NSString alloc] initWithBytes:pi length:piLen encoding:NSASCIIStringEncoding];
+    if (!piText) return nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[0-9a-f]{32}" options:0 error:nil];
+    NSTextCheckingResult *match = [re firstMatchInString:piText options:0 range:NSMakeRange(0, piText.length)];
+    if (!match) return nil;
+    NSString *attachMd5 = [piText substringWithRange:match.range];
+    NSString *convMd5 = [node.tableName substringFromIndex:4];
+    NSString *root = ym_xwechat_files_root();
+    if (!root) return nil;
+    NSString *convDir = [[[[root stringByAppendingPathComponent:node.database.account]
+        stringByAppendingPathComponent:@"msg"] stringByAppendingPathComponent:@"attach"]
+        stringByAppendingPathComponent:convMd5];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *fullPath = nil, *thumbPath = nil;
+    NSDirectoryEnumerator *e = [fm enumeratorAtURL:[NSURL fileURLWithPath:convDir]
+                        includingPropertiesForKeys:nil options:0 errorHandler:nil];
+    for (NSURL *url in e) {
+        NSString *name = url.lastPathComponent;
+        if (![name hasPrefix:attachMd5] || ![name hasSuffix:@".dat"]) continue;
+        if ([name hasSuffix:@"_t.dat"]) thumbPath = url.path;
+        else fullPath = url.path;
+    }
+    if (!fullPath && !thumbPath) return nil;
+    // 原图优先；wxgf 等不可显示格式回退缩略图（通常是 JPEG/GIF）
+    NSString *datPath = fullPath ?: thumbPath;
+
+    // 确保 seed（缓存 → 尾部投票 → 爆破）；密钥派生用去后缀的用户名
+    NSString *wxid = ym_attach_username_for_account(node.database.account);
+    if (self.attachSeed == 0) {
+        self.attachSeed = ym_attach_cached_seed(wxid);
+    }
+    if (self.attachSeed == 0) {
+        if (!self.attachXorKnown) {
+            self.attachXor = ym_attach_xor_vote(node.database.account);
+            self.attachXorKnown = YES;
+        }
+        if (self.attachXor != 0) {
+            NSMutableArray<NSString *> *samples = [NSMutableArray array];
+            NSDirectoryEnumerator *se = [fm enumeratorAtURL:[NSURL fileURLWithPath:convDir]
+                                 includingPropertiesForKeys:@[NSURLFileSizeKey] options:0 errorHandler:nil];
+            for (NSURL *url in se) {
+                if (samples.count >= 3) break;
+                NSString *name = url.lastPathComponent;
+                if (![name hasSuffix:@".dat"] || [name hasSuffix:@"_t.dat"]) continue;
+                NSNumber *size = nil;
+                [url getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
+                if (!size || size.unsignedLongLongValue > 1500000 || size.unsignedLongLongValue < 512) continue;
+                NSFileHandle *fh = [NSFileHandle fileHandleForReadingFromURL:url error:nil];
+                NSData *head = [fh readDataOfLength:6];
+                [fh closeFile];
+                if (head.length == 6 && memcmp(head.bytes, "\x07\x08V2\x08\x07", 6) == 0) {
+                    [samples addObject:url.path];
+                }
+            }
+            if (samples.count == 0 && datPath) samples = [NSMutableArray arrayWithObject:datPath];
+            NSString *samplePaths[3] = {nil, nil, nil};
+            NSUInteger sampleCount = MIN(samples.count, (NSUInteger)3);
+            for (NSUInteger i = 0; i < sampleCount; i++) samplePaths[i] = samples[i];
+            self.attachSeed = ym_attach_brute_seed((NSString * const *)samplePaths, sampleCount,
+                                                   wxid, self.attachXor);
+            if (self.attachSeed > 0) ym_attach_store_seed(wxid, self.attachSeed);
+        }
+    }
+    if (self.attachSeed == 0) return nil;
+
+    char keySource[96];
+    snprintf(keySource, sizeof(keySource), "%llu%s", self.attachSeed, wxid.UTF8String);
+    unsigned char md5[16];
+    CC_MD5(keySource, (CC_LONG)strlen(keySource), md5);
+    char hex[33];
+    for (int i = 0; i < 16; i++) sprintf(hex + i * 2, "%02x", md5[i]);
+    unsigned char xorKey = self.attachXorKnown ? self.attachXor : (unsigned char)(self.attachSeed & 0xFF);
+    for (NSString *candidate in @[datPath, thumbPath ?: @""]) {
+        if (candidate.length == 0) continue;
+        NSData *raw = [NSData dataWithContentsOfFile:candidate];
+        if (!raw) continue;
+        NSData *decoded = ym_v2_decode(raw, (const unsigned char *)hex, xorKey);
+        if (!decoded || decoded.length < 4) continue;
+        const unsigned char *h = (const unsigned char *)decoded.bytes;
+        BOOL viewable = (h[0] == 0xFF && h[1] == 0xD8) || (h[0] == 0x89 && h[1] == 0x50) ||
+                        (h[0] == 'G' && h[1] == 'I' && h[2] == 'F') ||
+                        (h[0] == 'R' && h[1] == 'I' && h[2] == 'F' && h[3] == 'F');
+        if (viewable) return decoded;
+    }
+    return nil;
+}
+
 #pragma mark NSTableViewDataSource / Delegate（行数据）
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
@@ -1308,12 +1609,17 @@ static NSString *ym_attach_info_for_row(const void *pi, int piLen,
                         int mcLen = sqlite3_column_bytes(stmt, 1);
                         NSString *fullContent = ym_text_from_bytes(mc, mcLen) ?: @"";
                         NSString *attachInfo = ym_attach_info_for_row(pi, piLen, mc, mcLen, self.currentNode);
+                        NSData *mediaData = (pi && piLen > 0)
+                            ? [self ym_decode_attachment:pi piLen:piLen] : nil;
                         dispatch_async(dispatch_get_main_queue(), ^{
                             self.previewText.string = fullContent.length > 0 ? fullContent : @"（无文本内容）";
                             if (attachInfo.length > 0) {
                                 self.previewText.string = [attachInfo stringByAppendingString:
                                     [@"\n\n—— 解码内容 ——\n" stringByAppendingString:fullContent]];
                             }
+                            NSImage *image = mediaData ? [[NSImage alloc] initWithData:mediaData] : nil;
+                            self.previewImage.image = image;
+                            self.previewImage.hidden = !image;
                         });
                     }
                     if (stmt) sqlite3_finalize(stmt);

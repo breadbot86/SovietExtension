@@ -1327,10 +1327,77 @@ static NSString *ym_local_type_label(NSInteger type)
     [self ym_loadNextRowsPage];
 }
 
+// 小程序视图：wacontact(名称/AppID) + 同步表(最近活跃) 组装
+- (void)ym_loadMiniProgramsForNode:(YMDbTreeNode *)node
+{
+    YMDbBrowserDatabaseItem *item = node.database;
+    self.statusField.stringValue = @"正在读取小程序列表 …";
+    dispatch_async(self.workQueue, ^{
+        NSString *error = nil;
+        NSString *decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error, NO);
+        if (!decrypted) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.statusField.stringValue = error ?: @"解密失败";
+            });
+            return;
+        }
+        // 名称与 AppID
+        NSMutableDictionary<NSString *, NSDictionary *> *apps = [NSMutableDictionary dictionary];
+        sqlite3 *db = NULL;
+        NSString *uri = [NSString stringWithFormat:@"file://%@?immutable=1", decrypted];
+        if (sqlite3_open_v2(uri.UTF8String, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
+            sqlite3_stmt *stmt = NULL;
+            if (sqlite3_prepare_v2(db, "SELECT user_name, app_id, contact_pack_data FROM wacontact",
+                                   -1, &stmt, NULL) == SQLITE_OK) {
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    const unsigned char *un = sqlite3_column_text(stmt, 0);
+                    if (!un) continue;
+                    NSString *username = [NSString stringWithUTF8String:(const char *)un];
+                    const void *pack = sqlite3_column_blob(stmt, 2);
+                    int packLen = sqlite3_column_bytes(stmt, 2);
+                    const unsigned char *appid = sqlite3_column_text(stmt, 1);
+                    apps[username] = @{
+                        @"name": ym_wacontact_name(pack, packLen) ?: username,
+                        @"appid": appid ? [NSString stringWithUTF8String:(const char *)appid] : @"",
+                    };
+                }
+            }
+            if (stmt) sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+        // 行：名称 | 小程序ID | AppID | 最近活跃
+        NSDictionary *result = ym_sqlite_query(decrypted,
+            @"SELECT user_name, last_update_time FROM WeAppBizAttrSyncBufferTableV02 "
+             "ORDER BY last_update_time DESC", nil);
+        NSMutableArray *rows = [NSMutableArray array];
+        for (NSArray *row in result[@"rows"]) {
+            if (row.count < 2) continue;
+            NSDictionary *info = apps[row[0]] ?: @{@"name": row[0], @"appid": @""};
+            [rows addObject:@[info[@"name"], row[0], info[@"appid"],
+                              ym_format_timestamp([row[1] longLongValue])]];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.currentNode != node) return;
+            self.columns = @[@"名称", @"小程序ID", @"AppID", @"最近活跃"];
+            self.rows = rows;
+            self.rowsLoaded = rows.count;
+            self.currentTableTotal = rows.count;
+            [self ym_rebuildRowsColumns];
+            [self ym_updateLoadMoreButton];
+            self.statusField.stringValue = [NSString stringWithFormat:
+                @"小程序 %lu 个（名称取自本地 wacontact 记录）", (unsigned long)rows.count];
+        });
+    });
+}
+
 - (void)ym_loadNextRowsPage
 {
     YMDbTreeNode *node = self.currentNode;
     if (!node || !node.database) return;
+    if (node.kind == YMDbTreeNodeMiniPrograms) {
+        if (self.rowsLoaded == 0) [self ym_loadMiniProgramsForNode:node];
+        return;
+    }
     if (self.rowsLoaded > 0 && self.currentTableTotal >= 0 &&
         self.rowsLoaded >= self.currentTableTotal) return;
     YMDbBrowserDatabaseItem *item = node.database;
@@ -1623,6 +1690,34 @@ static NSString *ym_resolve_video_poster(const void *pi, int piLen, NSString *ac
         for (NSString *name in @[[(NSString *)[md5 stringByAppendingString:@"_thumb.jpg"] copy], [md5 stringByAppendingString:@".jpg"]]) {
             NSString *candidate = [dir stringByAppendingPathComponent:name];
             if ([fm fileExistsAtPath:candidate]) return candidate;
+        }
+    }
+    return nil;
+}
+
+// wacontact.contactPackData：protobuf，field 2 = 小程序名称（UTF-8）
+static NSString *ym_wacontact_name(const void *blob, int len)
+{
+    if (!blob || len <= 0) return nil;
+    const unsigned char *p = (const unsigned char *)blob;
+    const unsigned char *end = p + len;
+    while (p < end) {
+        unsigned char tag = *p++;
+        int wire = tag & 6;
+        if (wire == 2) {  // length-delimited
+            if (p >= end) break;
+            int l = *p++;  // 名称长度 < 128，单字节 varint 足够
+            if (l & 0x80 || p + l > end) break;
+            if (tag == 0x12) {
+                NSString *name = [[NSString alloc] initWithBytes:p length:l encoding:NSUTF8StringEncoding];
+                if (name) return name;
+            }
+            p += l;
+        } else if (wire == 0) {  // varint 值跳过
+            while (p < end && (*p & 0x80)) p++;
+            p++;
+        } else {
+            break;
         }
     }
     return nil;

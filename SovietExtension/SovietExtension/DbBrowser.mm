@@ -1567,6 +1567,54 @@ static NSString *ym_attach_info_for_row(const void *pi, int piLen,
     return nil;
 }
 
+// 视频消息的 md5 → msg/video/<年月>/<md5>.mp4（明文存储，无需解密）
+static NSString *ym_resolve_video_file(const void *pi, int piLen, NSString *account)
+{
+    if (!pi || piLen <= 0) return nil;
+    NSString *piText = [[NSString alloc] initWithBytes:pi length:piLen encoding:NSASCIIStringEncoding];
+    if (!piText) return nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[0-9a-f]{32}" options:0 error:nil];
+    NSTextCheckingResult *match = [re firstMatchInString:piText options:0 range:NSMakeRange(0, piText.length)];
+    if (!match) return nil;
+    NSString *md5 = [piText substringWithRange:match.range];
+    NSString *root = ym_xwechat_files_root();
+    if (!root) return nil;
+    NSString *videoRoot = [[[root stringByAppendingPathComponent:account]
+        stringByAppendingPathComponent:@"msg"] stringByAppendingPathComponent:@"video"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *month in [fm contentsOfDirectoryAtPath:videoRoot error:nil]) {
+        NSString *candidate = [[videoRoot stringByAppendingPathComponent:month]
+            stringByAppendingPathComponent:[md5 stringByAppendingString:@".mp4"]];
+        if ([fm fileExistsAtPath:candidate]) return candidate;
+    }
+    return nil;
+}
+
+// 视频海报图（_thumb.jpg，明文）
+static NSString *ym_resolve_video_poster(const void *pi, int piLen, NSString *account)
+{
+    if (!pi || piLen <= 0) return nil;
+    NSString *piText = [[NSString alloc] initWithBytes:pi length:piLen encoding:NSASCIIStringEncoding];
+    if (!piText) return nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[0-9a-f]{32}" options:0 error:nil];
+    NSTextCheckingResult *match = [re firstMatchInString:piText options:0 range:NSMakeRange(0, piText.length)];
+    if (!match) return nil;
+    NSString *md5 = [piText substringWithRange:match.range];
+    NSString *root = ym_xwechat_files_root();
+    if (!root) return nil;
+    NSString *videoRoot = [[[root stringByAppendingPathComponent:account]
+        stringByAppendingPathComponent:@"msg"] stringByAppendingPathComponent:@"video"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *month in [fm contentsOfDirectoryAtPath:videoRoot error:nil]) {
+        NSString *dir = [videoRoot stringByAppendingPathComponent:month];
+        for (NSString *name in @[[(NSString *)[md5 stringByAppendingString:@"_thumb.jpg"] copy], [md5 stringByAppendingString:@".jpg"]]) {
+            NSString *candidate = [dir stringByAppendingPathComponent:name];
+            if ([fm fileExistsAtPath:candidate]) return candidate;
+        }
+    }
+    return nil;
+}
+
 static BOOL ym_media_is_video(NSData *data)
 {
     const unsigned char *h = (const unsigned char *)data.bytes;
@@ -1636,7 +1684,12 @@ static BOOL ym_media_is_video(NSData *data)
                         int mcLen = sqlite3_column_bytes(stmt, 1);
                         NSString *fullContent = ym_text_from_bytes(mc, mcLen) ?: @"";
                         NSString *attachInfo = ym_attach_info_for_row(pi, piLen, mc, mcLen, self.currentNode);
-                        NSData *mediaData = (pi && piLen > 0)
+                        YMDbTreeNode *nodeNow = self.currentNode;
+                        NSString *plainVideo = (pi && piLen > 0 && nodeNow.database)
+                            ? ym_resolve_video_file(pi, piLen, nodeNow.database.account) : nil;
+                        NSString *videoPoster = (pi && piLen > 0 && nodeNow.database && !plainVideo)
+                            ? ym_resolve_video_poster(pi, piLen, nodeNow.database.account) : nil;
+                        NSData *mediaData = (pi && piLen > 0 && !plainVideo)
                             ? [self ym_decode_attachment:pi piLen:piLen] : nil;
                         dispatch_async(dispatch_get_main_queue(), ^{
                             self.previewText.string = fullContent.length > 0 ? fullContent : @"（无文本内容）";
@@ -1649,7 +1702,12 @@ static BOOL ym_media_is_video(NSData *data)
                             self.previewPlayer.player = nil;
                             self.previewImage.image = nil;
                             self.previewImage.hidden = YES;
-                            if (mediaData) {
+                            if (plainVideo.length > 0) {
+                                // msg/video 下的明文 MP4，直接播放
+                                self.previewPlayer.player = [AVPlayer playerWithURL:
+                                    [NSURL fileURLWithPath:plainVideo]];
+                                self.previewPlayer.hidden = NO;
+                            } else if (mediaData) {
                                 if (ym_media_is_video(mediaData)) {
                                     NSString *videoPath = [ym_db_cache_directory()
                                         stringByAppendingPathComponent:[NSString stringWithFormat:@"preview_%@.mp4", localId]];
@@ -1664,6 +1722,13 @@ static BOOL ym_media_is_video(NSData *data)
                                         self.previewImage.image = image;
                                         self.previewImage.hidden = NO;
                                     }
+                                }
+                            }
+                            if (!plainVideo && !mediaData && videoPoster.length > 0) {
+                                NSImage *poster = [[NSImage alloc] initWithContentsOfFile:videoPoster];
+                                if (poster) {
+                                    self.previewImage.image = poster;
+                                    self.previewImage.hidden = NO;
                                 }
                             }
                         });

@@ -630,6 +630,7 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 @property (nonatomic, assign) NSInteger currentTableTotal;  // -1 未知
 @property (nonatomic, assign) NSInteger rowsLoaded;
 - (void)showWindowCentered;
+- (void)ym_dumpDiagnostics;
 @end
 
 @implementation DbBrowserWindowController
@@ -662,54 +663,44 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 
 - (void)ym_buildUI
 {
+    // 经典手动布局 + autoresizingMask：宿主进程里 Autolayout 与
+    // NSSplitView 组合出现多版本渲染异常（面板错位/空白），改用确定性布局。
     NSView *content = self.window.contentView;
+    CGFloat width = content.bounds.size.width;
+    CGFloat height = content.bounds.size.height;
+    const CGFloat kTopBar = 34, kStatus = 26, kTreeW = 300, kPreviewW = 330;
 
     NSSegmentedControl *modeControl = [NSSegmentedControl segmentedControlWithLabels:@[@"简易模式", @"专业模式"
         ] trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(ym_modeChanged:)];
-    modeControl.translatesAutoresizingMaskIntoConstraints = NO;
-    modeControl.segmentStyle = NSSegmentStyleTexturedRounded;
     modeControl.controlSize = NSControlSizeSmall;
+    modeControl.segmentStyle = NSSegmentStyleTexturedRounded;
     modeControl.selectedSegment = self.simpleMode ? 0 : 1;
+    modeControl.frame = NSMakeRect(10, height - kTopBar + 4, 210, 24);
+    modeControl.autoresizingMask = NSViewMinYMargin;
     [content addSubview:modeControl];
     _modeControl = modeControl;
-
-    NSSplitView *split = [[NSSplitView alloc] init];
-    split.translatesAutoresizingMaskIntoConstraints = NO;
-    split.vertical = YES;  // 左右分栏（默认为上下分割）
-    split.dividerStyle = NSSplitViewDividerStyleThin;
-    [content addSubview:split];
 
     NSTextField *status = [NSTextField labelWithString:@"点击左侧 ▶ 展开数据库，选择表查看数据"];
     status.font = [NSFont systemFontOfSize:11];
     status.textColor = [NSColor secondaryLabelColor];
     status.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    status.translatesAutoresizingMaskIntoConstraints = NO;
+    status.frame = NSMakeRect(10, 4, width - 20, 18);
+    status.autoresizingMask = NSViewWidthSizable;
     [content addSubview:status];
     _statusField = status;
 
-    [NSLayoutConstraint activateConstraints:@[
-        [modeControl.topAnchor constraintEqualToAnchor:content.topAnchor constant:8],
-        [modeControl.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:10],
-        [modeControl.heightAnchor constraintEqualToConstant:24],
-        [split.topAnchor constraintEqualToAnchor:modeControl.bottomAnchor constant:8],
-        [split.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
-        [split.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
-        [split.bottomAnchor constraintEqualToAnchor:status.topAnchor constant:-6],
-        [status.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:10],
-        [status.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-10],
-        [status.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-8],
-    ]];
+    CGFloat bodyY = kStatus;
+    CGFloat bodyH = height - kTopBar - kStatus;
 
-    // 左：树（账号 ▶ 数据库 ▶ 表）
+    // 左：树
     NSScrollView *treeScroll = [[NSScrollView alloc] init];
-    treeScroll.translatesAutoresizingMaskIntoConstraints = NO;
     treeScroll.hasVerticalScroller = YES;
     treeScroll.hasHorizontalScroller = YES;
     treeScroll.autohidesScrollers = YES;
     treeScroll.borderType = NSBezelBorder;
-    NSOutlineView *outline = [[NSOutlineView alloc] initWithFrame:NSZeroRect];
+    NSOutlineView *outline = [[NSOutlineView alloc] initWithFrame:NSMakeRect(0, 0, kTreeW - 2, bodyH)];
     NSTableColumn *treeColumn = [[NSTableColumn alloc] initWithIdentifier:@"tree"];
-    treeColumn.width = 320;
+    treeColumn.width = 340;
     treeColumn.resizingMask = NSTableColumnUserResizingMask | NSTableColumnAutoresizingMask;
     [outline addTableColumn:treeColumn];
     outline.outlineTableColumn = treeColumn;
@@ -720,11 +711,20 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     outline.delegate = self;
     outline.usesAlternatingRowBackgroundColors = YES;
     treeScroll.documentView = outline;
+    treeScroll.frame = NSMakeRect(0, bodyY, kTreeW, bodyH);
+    treeScroll.autoresizingMask = NSViewHeightSizable;
+    [content addSubview:treeScroll];
     _outlineView = outline;
 
-    // 右：行数据 + 加载更多
+    // 中：行数据 + 加载更多
+    NSView *rowsPane = [[NSView alloc] init];
+    CGFloat rowsX = kTreeW + 6;
+    CGFloat rowsW = width - kTreeW - kPreviewW - 12;
+    rowsPane.frame = NSMakeRect(rowsX, bodyY, MAX(rowsW, 320), bodyH);
+    rowsPane.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [content addSubview:rowsPane];
+
     NSScrollView *rowsScroll = [[NSScrollView alloc] init];
-    rowsScroll.translatesAutoresizingMaskIntoConstraints = NO;
     rowsScroll.hasVerticalScroller = YES;
     rowsScroll.hasHorizontalScroller = YES;
     rowsScroll.autohidesScrollers = YES;
@@ -736,89 +736,83 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     rowsTable.usesAlternatingRowBackgroundColors = YES;
     // 列宽固定不随视口压缩，多列时靠横向滚动查看全部数据
     rowsTable.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
-    rowsTable.backgroundColor = [NSColor textBackgroundColor];
     rowsScroll.documentView = rowsTable;
+    rowsScroll.frame = NSMakeRect(0, 30, rowsPane.bounds.size.width, rowsPane.bounds.size.height - 30);
+    rowsScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [rowsPane addSubview:rowsScroll];
     _rowsTable = rowsTable;
 
     NSButton *loadMore = [NSButton buttonWithTitle:@"加载更多"
                                             target:self
                                             action:@selector(ym_loadMoreRows:)];
-    loadMore.translatesAutoresizingMaskIntoConstraints = NO;
     loadMore.bezelStyle = NSBezelStyleRounded;
     loadMore.controlSize = NSControlSizeSmall;
     loadMore.font = [NSFont systemFontOfSize:11];
     loadMore.hidden = YES;
+    loadMore.frame = NSMakeRect(0, 0, 130, 24);
+    loadMore.autoresizingMask = NSViewMaxYMargin;
+    [rowsPane addSubview:loadMore];
     _loadMoreButton = loadMore;
 
-    NSView *rowsPane = [[NSView alloc] init];
-    rowsPane.translatesAutoresizingMaskIntoConstraints = NO;
-    [rowsPane addSubview:rowsScroll];
-    [rowsPane addSubview:loadMore];
-    [NSLayoutConstraint activateConstraints:@[
-        [rowsScroll.topAnchor constraintEqualToAnchor:rowsPane.topAnchor],
-        [rowsScroll.leadingAnchor constraintEqualToAnchor:rowsPane.leadingAnchor],
-        [rowsScroll.trailingAnchor constraintEqualToAnchor:rowsPane.trailingAnchor],
-        [rowsScroll.bottomAnchor constraintEqualToAnchor:loadMore.topAnchor constant:-6],
-        [loadMore.leadingAnchor constraintEqualToAnchor:rowsPane.leadingAnchor],
-        [loadMore.bottomAnchor constraintEqualToAnchor:rowsPane.bottomAnchor],
-        [loadMore.heightAnchor constraintEqualToConstant:24],
-    ]];
-
-    // 预览面板：选中行显示完整解码内容与媒体文件信息
+    // 右：预览面板
     NSView *previewPane = [[NSView alloc] init];
-    previewPane.translatesAutoresizingMaskIntoConstraints = NO;
+    previewPane.frame = NSMakeRect(width - kPreviewW, bodyY, kPreviewW, bodyH);
+    previewPane.autoresizingMask = NSViewMinXMargin | NSViewHeightSizable;
+    [content addSubview:previewPane];
+
     NSTextField *previewTitle = [NSTextField labelWithString:@"预览"];
     previewTitle.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
-    previewTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    previewTitle.frame = NSMakeRect(4, previewPane.bounds.size.height - 18, kPreviewW - 8, 16);
+    previewTitle.autoresizingMask = NSViewMinYMargin;
     [previewPane addSubview:previewTitle];
-    NSScrollView *previewScroll = [[NSScrollView alloc] init];
-    previewScroll.translatesAutoresizingMaskIntoConstraints = NO;
-    previewScroll.hasVerticalScroller = YES;
-    previewScroll.hasHorizontalScroller = YES;
-    previewScroll.autohidesScrollers = YES;
-    previewScroll.borderType = NSBezelBorder;
-    NSTextView *previewText = [[NSTextView alloc] initWithFrame:NSZeroRect];
-    previewText.editable = NO;
-    previewText.selectable = YES;
-    previewText.richText = NO;
-    previewText.font = [NSFont fontWithName:@"Menlo" size:11] ?: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-    previewText.backgroundColor = [NSColor textBackgroundColor];
-    previewScroll.documentView = previewText;
-    [previewPane addSubview:previewScroll];
-    [NSLayoutConstraint activateConstraints:@[
-        [previewTitle.topAnchor constraintEqualToAnchor:previewPane.topAnchor],
-        [previewTitle.leadingAnchor constraintEqualToAnchor:previewPane.leadingAnchor constant:4],
-        [previewTitle.heightAnchor constraintEqualToConstant:20],
-        [previewScroll.leadingAnchor constraintEqualToAnchor:previewPane.leadingAnchor],
-        [previewScroll.trailingAnchor constraintEqualToAnchor:previewPane.trailingAnchor],
-        [previewScroll.bottomAnchor constraintEqualToAnchor:previewPane.bottomAnchor],
-    ]];
+    _previewTitle = previewTitle;
+
     NSImageView *previewImage = [[NSImageView alloc] init];
-    previewImage.translatesAutoresizingMaskIntoConstraints = NO;
     previewImage.imageScaling = NSImageScaleProportionallyUpOrDown;
     previewImage.imageAlignment = NSImageAlignCenter;
     previewImage.wantsLayer = YES;
     previewImage.layer.borderColor = [NSColor separatorColor].CGColor;
     previewImage.layer.borderWidth = 1.0;
     previewImage.hidden = YES;
+    previewImage.frame = NSMakeRect(0, previewPane.bounds.size.height - 240, kPreviewW, 220);
+    previewImage.autoresizingMask = NSViewMinYMargin;
     [previewPane addSubview:previewImage];
-    [NSLayoutConstraint activateConstraints:@[
-        [previewImage.topAnchor constraintEqualToAnchor:previewTitle.bottomAnchor constant:4],
-        [previewImage.leadingAnchor constraintEqualToAnchor:previewPane.leadingAnchor],
-        [previewImage.trailingAnchor constraintEqualToAnchor:previewPane.trailingAnchor],
-        [previewImage.heightAnchor constraintEqualToConstant:220],
-        [previewScroll.topAnchor constraintEqualToAnchor:previewImage.bottomAnchor constant:4],
-    ]];
-    _previewTitle = previewTitle;
-    _previewScroll = previewScroll;
-    _previewText = previewText;
     _previewImage = previewImage;
 
-    [split addArrangedSubview:treeScroll];
-    [split addArrangedSubview:rowsPane];
-    [split addArrangedSubview:previewPane];
-    [split setPosition:320 ofDividerAtIndex:0];
-    [split setPosition:700 ofDividerAtIndex:1];
+    NSScrollView *previewScroll = [[NSScrollView alloc] init];
+    previewScroll.hasVerticalScroller = YES;
+    previewScroll.hasHorizontalScroller = YES;
+    previewScroll.autohidesScrollers = YES;
+    previewScroll.borderType = NSBezelBorder;
+    NSTextView *previewText = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, kPreviewW - 24, 100)];
+    previewText.editable = NO;
+    previewText.selectable = YES;
+    previewText.richText = NO;
+    previewText.font = [NSFont fontWithName:@"Menlo" size:11] ?: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    previewText.autoresizingMask = NSViewWidthSizable;
+    previewScroll.documentView = previewText;
+    previewScroll.frame = NSMakeRect(0, 0, kPreviewW, previewPane.bounds.size.height - 244);
+    previewScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [previewPane addSubview:previewScroll];
+    _previewScroll = previewScroll;
+    _previewText = previewText;
+}
+
+
+// 自诊断：渲染窗口 + 布局尺寸落盘，便于排查「打开为空」类问题
+- (void)ym_dumpDiagnostics
+{
+    os_log(ym_db_browser_log(), "diag: roots=%lu outlineRows=%ld mode=%ld win=%@",
+           (unsigned long)self.rootNodes.count, (long)self.outlineView.numberOfRows,
+           (long)self.simpleMode, NSStringFromRect(self.window.contentView.frame));
+    @try {
+        [self.window layoutIfNeeded];
+        NSData *pdf = [self.window.contentView dataWithPDFInsideRect:self.window.contentView.bounds];
+        [pdf writeToFile:@"/tmp/SovietExtensionDbBrowser.pdf" atomically:YES];
+        os_log(ym_db_browser_log(), "diag pdf written: %lu bytes", (unsigned long)pdf.length);
+    } @catch (NSException *e) {
+        os_log_error(ym_db_browser_log(), "diag pdf failed: %{public}@", e.reason);
+    }
 }
 
 - (void)showWindowCentered
@@ -828,6 +822,10 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     if (!self.window.isVisible) [self.window center];
     [NSApp activateIgnoringOtherApps:YES];
     [self.window makeKeyAndOrderFront:nil];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        [self ym_dumpDiagnostics];
+    });
 }
 
 - (void)ym_modeChanged:(NSSegmentedControl *)sender

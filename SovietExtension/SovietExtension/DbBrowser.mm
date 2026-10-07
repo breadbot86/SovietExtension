@@ -205,10 +205,16 @@ static NSString *ym_decrypt_database(NSString *dbPath, NSString *keyHex, NSStrin
 #pragma mark - sqlite 读取
 
 // 只读查询；返回 @{columns: NSArray<NSString*>, rows: NSArray<NSArray<NSString*>*>}
+// 解密副本从源库继承 WAL 模式文件头（0x12/0x13 处 02 02），只读连接首次访问
+// 需建 -shm 会被拒（SQLITE_CANTOPEN "unable to open database file"）。
+// 副本是本插件独占的私有快照，用 immutable=1 打开：免锁免 journal，语义安全。
 static NSDictionary *ym_sqlite_query(NSString *databasePath, NSString *sql, NSString **outError)
 {
     sqlite3 *db = NULL;
-    if (sqlite3_open_v2(databasePath.UTF8String, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+    NSString *uri = [NSString stringWithFormat:@"file://%@?immutable=1",
+        [[databasePath stringByReplacingOccurrencesOfString:@"?" withString:@"%3F"]
+            stringByReplacingOccurrencesOfString:@"#" withString:@"%23"]];
+    if (sqlite3_open_v2(uri.UTF8String, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) != SQLITE_OK) {
         if (outError) *outError = @"打开数据库失败（密钥可能不匹配，请重新提取）";
         if (db) sqlite3_close(db);
         return nil;
@@ -285,6 +291,7 @@ static BOOL ym_error_looks_corrupt(NSString *error)
     if (error.length == 0) return NO;
     return [error rangeOfString:@"malformed"].location != NSNotFound ||
            [error rangeOfString:@"not a database"].location != NSNotFound ||
+           [error rangeOfString:@"unable to open"].location != NSNotFound ||
            [error rangeOfString:@"打开数据库失败"].location != NSNotFound;
 }
 

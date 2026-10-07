@@ -340,11 +340,16 @@ static NSString *ym_xwechat_files_root(void)
 }
 @end
 
-// 树节点：账号(0) ▶ 数据库(1) ▶ 表(2)；9 用于「加载中/出错」占位
+// 树节点：专业模式 账号(0)▶数据库(1)▶表(2)；简易模式 聊天分组(3)▶会话(4)、
+// 联系人总览(5)、会话列表总览(6)；9 用于「加载中/出错」占位
 typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     YMDbTreeNodeAccount = 0,
     YMDbTreeNodeDatabase = 1,
     YMDbTreeNodeTable = 2,
+    YMDbTreeNodeSimpleChatGroup = 3,
+    YMDbTreeNodeConversation = 4,
+    YMDbTreeNodeContactsOverview = 5,
+    YMDbTreeNodeSessionsOverview = 6,
     YMDbTreeNodePlaceholder = 9,
 };
 
@@ -354,9 +359,9 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 @property (nonatomic, strong) NSMutableArray<YMDbTreeNode *> *children;
 @property (nonatomic, assign) BOOL expandable;
 @property (nonatomic, assign) BOOL childrenLoaded;  // 数据库节点：表列表是否已加载
-@property (nonatomic, strong) YMDbBrowserDatabaseItem *database;  // 数据库/表节点
-@property (nonatomic, copy) NSString *tableName;                  // 表节点
-@property (nonatomic, copy) NSString *tableCount;                 // 表节点
+@property (nonatomic, strong) YMDbBrowserDatabaseItem *database;  // 数据库/表/会话节点
+@property (nonatomic, copy) NSString *tableName;                  // 表/会话节点（Msg_<md5>）
+@property (nonatomic, copy) NSString *tableCount;                 // 表/会话节点
 @end
 
 @implementation YMDbTreeNode
@@ -380,7 +385,12 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 @property (nonatomic, weak) NSTableView *rowsTable;
 @property (nonatomic, weak) NSButton *loadMoreButton;
 @property (nonatomic, weak) NSTextField *statusField;
+@property (nonatomic, weak) NSSegmentedControl *modeControl;
+@property (nonatomic, assign) BOOL simpleMode;                      // YES=简易模式
+@property (nonatomic, strong) NSDictionary<NSString *, NSString *> *contactNames;  // username → 显示名
+@property (nonatomic, copy) NSString *selfUsername;
 @property (nonatomic, strong) dispatch_queue_t workQueue;
+@property (nonatomic, strong) YMDbTreeNode *currentNode;            // 当前加载数据的节点
 @property (nonatomic, strong) YMDbBrowserDatabaseItem *currentDatabase;
 @property (nonatomic, copy) NSString *currentTableName;
 @property (nonatomic, assign) NSInteger currentTableTotal;  // -1 未知
@@ -408,6 +418,8 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
         _rootNodes = @[];
         _columns = @[];
         _rows = @[];
+        _contactNames = @{};
+        _simpleMode = [[NSUserDefaults standardUserDefaults] boolForKey:@"kDbBrowserSimpleMode.SOVIET"];
         [self ym_buildUI];
         window.delegate = self;
     }
@@ -417,6 +429,15 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 - (void)ym_buildUI
 {
     NSView *content = self.window.contentView;
+
+    NSSegmentedControl *modeControl = [NSSegmentedControl segmentedControlWithLabels:@[@"简易模式", @"专业模式"
+        ] trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(ym_modeChanged:)];
+    modeControl.translatesAutoresizingMaskIntoConstraints = NO;
+    modeControl.segmentStyle = NSSegmentStyleTexturedRounded;
+    modeControl.controlSize = NSControlSizeSmall;
+    modeControl.selectedSegment = self.simpleMode ? 0 : 1;
+    [content addSubview:modeControl];
+    _modeControl = modeControl;
 
     NSSplitView *split = [[NSSplitView alloc] init];
     split.translatesAutoresizingMaskIntoConstraints = NO;
@@ -432,7 +453,10 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     _statusField = status;
 
     [NSLayoutConstraint activateConstraints:@[
-        [split.topAnchor constraintEqualToAnchor:content.topAnchor],
+        [modeControl.topAnchor constraintEqualToAnchor:content.topAnchor constant:8],
+        [modeControl.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:10],
+        [modeControl.heightAnchor constraintEqualToConstant:24],
+        [split.topAnchor constraintEqualToAnchor:modeControl.bottomAnchor constant:8],
         [split.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
         [split.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
         [split.bottomAnchor constraintEqualToAnchor:status.topAnchor constant:-6],
@@ -519,18 +543,23 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     [self.window makeKeyAndOrderFront:nil];
 }
 
-#pragma mark 树加载
+- (void)ym_modeChanged:(NSSegmentedControl *)sender
+{
+    BOOL simple = sender.selectedSegment == 0;
+    if (simple == self.simpleMode) return;
+    self.simpleMode = simple;
+    [[NSUserDefaults standardUserDefaults] setBool:simple forKey:@"kDbBrowserSimpleMode.SOVIET"];
+    [self ym_reloadTree];
+}
 
-- (void)ym_reloadTree
+// 收集密钥存档覆盖的全部数据库（两种模式共用）
+- (NSArray<YMDbBrowserDatabaseItem *> *)ym_collectDatabaseItems
 {
     NSString *keysDir = YMKeyExportDirectory();
     NSString *root = ym_xwechat_files_root();
-    if (!root) {
-        self.statusField.stringValue = @"未找到微信数据目录";
-        return;
-    }
+    if (!root) return @[];
 
-    NSMutableArray<YMDbTreeNode *> *roots = [NSMutableArray array];
+    NSMutableArray<YMDbBrowserDatabaseItem *> *all = [NSMutableArray array];
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *fileName in [fm contentsOfDirectoryAtPath:keysDir error:nil]) {
         if (![fileName.pathExtension isEqualToString:@"json"]) continue;
@@ -540,13 +569,6 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
         if (![archive isKindOfClass:[NSDictionary class]]) continue;
         NSString *storage = [[root stringByAppendingPathComponent:account]
             stringByAppendingPathComponent:@"db_storage"];
-
-        YMDbTreeNode *accountNode = [[YMDbTreeNode alloc] init];
-        accountNode.kind = YMDbTreeNodeAccount;
-        accountNode.title = account;
-        accountNode.expandable = YES;
-        accountNode.childrenLoaded = YES;
-
         NSMutableArray<YMDbBrowserDatabaseItem *> *items = [NSMutableArray array];
         for (NSString *rel in archive.allKeys) {
             if (![rel isKindOfClass:[NSString class]]) continue;
@@ -564,27 +586,44 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
             [items addObject:item];
         }
         [items sortUsingComparator:^NSComparisonResult(YMDbBrowserDatabaseItem *a, YMDbBrowserDatabaseItem *b) {
-            return [a.relativePath compare:b.relativePath];
+            NSComparisonResult c = [a.account compare:b.account];
+            return c != NSOrderedSame ? c : [a.relativePath compare:b.relativePath];
         }];
-        for (YMDbBrowserDatabaseItem *item in items) {
-            YMDbTreeNode *dbNode = [[YMDbTreeNode alloc] init];
-            dbNode.kind = YMDbTreeNodeDatabase;
-            dbNode.title = item.relativePath;
-            dbNode.expandable = YES;
-            dbNode.childrenLoaded = NO;
-            dbNode.database = item;
-            [accountNode.children addObject:dbNode];
+        [all addObjectsFromArray:items];
+    }
+    return all;
+}
+
+- (void)ym_reloadTree
+{
+    if (self.simpleMode) {
+        [self ym_reloadSimpleTree];
+        return;
+    }
+
+    NSArray<YMDbBrowserDatabaseItem *> *items = [self ym_collectDatabaseItems];
+    NSMutableArray<YMDbTreeNode *> *roots = [NSMutableArray array];
+    YMDbTreeNode *currentAccount = nil;
+    for (YMDbBrowserDatabaseItem *item in items) {
+        if (!currentAccount || ![currentAccount.title isEqualToString:item.account]) {
+            currentAccount = [[YMDbTreeNode alloc] init];
+            currentAccount.kind = YMDbTreeNodeAccount;
+            currentAccount.title = item.account;
+            currentAccount.expandable = YES;
+            currentAccount.childrenLoaded = YES;
+            [roots addObject:currentAccount];
         }
-        if (accountNode.children.count > 0) [roots addObject:accountNode];
+        YMDbTreeNode *dbNode = [[YMDbTreeNode alloc] init];
+        dbNode.kind = YMDbTreeNodeDatabase;
+        dbNode.title = item.relativePath;
+        dbNode.expandable = YES;
+        dbNode.childrenLoaded = NO;
+        dbNode.database = item;
+        [currentAccount.children addObject:dbNode];
     }
 
     self.rootNodes = roots;
-    self.columns = @[];
-    self.rows = @[];
-    self.currentDatabase = nil;
-    self.currentTableName = nil;
-    self.currentTableTotal = -1;
-    self.rowsLoaded = 0;
+    [self ym_resetDataPane];
     [self.outlineView reloadData];
     [self ym_rebuildRowsColumns];
     [self ym_updateLoadMoreButton];
@@ -594,6 +633,226 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     self.statusField.stringValue = roots.count > 0
         ? @"点击 ▶ 展开数据库，选择表查看数据"
         : @"密钥存档为空，请先执行「提取密钥」";
+}
+
+- (void)ym_resetDataPane
+{
+    self.columns = @[];
+    self.rows = @[];
+    self.currentNode = nil;
+    self.currentDatabase = nil;
+    self.currentTableName = nil;
+    self.currentTableTotal = -1;
+    self.rowsLoaded = 0;
+}
+
+#pragma mark 简易模式
+
+// 联系人显示名：备注 → 昵称 → 用户名
+static NSString *ym_contact_display(NSString *username, NSDictionary<NSString *, NSString *> *names)
+{
+    NSString *display = names[username];
+    if (display.length > 0) return display;
+    return username.length > 0 ? username : @"（未知）";
+}
+
+static NSString *ym_format_timestamp(NSInteger stamp)
+{
+    if (stamp <= 0) return @"";
+    static NSDateFormatter *formatter;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        formatter = [[NSDateFormatter alloc] init];
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    });
+    return [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:stamp]];
+}
+
+static NSString *ym_local_type_label(NSInteger type)
+{
+    switch (type) {
+        case 1: return @"文本";
+        case 3: return @"图片";
+        case 34: return @"语音";
+        case 42: return @"名片";
+        case 43: return @"视频";
+        case 47: return @"动画表情";
+        case 49: return @"文件/链接";
+        case 51: return @"位置";
+        case 10000: return @"系统消息";
+        case 10002: return @"撤回提示";
+        default: return [NSString stringWithFormat:@"%ld", (long)type];
+    }
+}
+
+- (void)ym_reloadSimpleTree
+{
+    NSArray<YMDbBrowserDatabaseItem *> *items = [self ym_collectDatabaseItems];
+    if (items.count == 0) {
+        self.rootNodes = @[];
+        [self ym_resetDataPane];
+        [self.outlineView reloadData];
+        self.statusField.stringValue = @"密钥存档为空，请先执行「提取密钥」";
+        return;
+    }
+    // 目录名形如 wxid_xxx_1b1f，去掉末尾实例后缀即本人用户名
+    NSString *account = items.firstObject.account;
+    if ([account hasPrefix:@"wxid_"] && account.length > 0) {
+        NSArray *parts = [account componentsSeparatedByString:@"_"];
+        if (parts.count >= 3) {
+            self.selfUsername = [[parts subarrayWithRange:NSMakeRange(0, parts.count - 1)]
+                componentsJoinedByString:@"_"];
+        }
+    }
+
+    // 静态骨架：聊天消息（异步填充）+ 联系人 + 会话列表
+    YMDbTreeNode *chatGroup = [[YMDbTreeNode alloc] init];
+    chatGroup.kind = YMDbTreeNodeSimpleChatGroup;
+    chatGroup.title = @"聊天消息";
+    chatGroup.expandable = YES;
+    chatGroup.childrenLoaded = YES;
+    YMDbTreeNode *loading = [[YMDbTreeNode alloc] init];
+    loading.kind = YMDbTreeNodePlaceholder;
+    loading.title = @"加载中…";
+    loading.expandable = NO;
+    [chatGroup.children addObject:loading];
+
+    YMDbTreeNode *contacts = [[YMDbTreeNode alloc] init];
+    contacts.kind = YMDbTreeNodeContactsOverview;
+    contacts.title = @"联系人";
+    contacts.expandable = NO;
+    YMDbTreeNode *sessions = [[YMDbTreeNode alloc] init];
+    sessions.kind = YMDbTreeNodeSessionsOverview;
+    sessions.title = @"会话列表";
+    sessions.expandable = NO;
+    for (YMDbBrowserDatabaseItem *item in items) {
+        if ([item.relativePath isEqualToString:@"contact/contact.db"]) contacts.database = item;
+        if ([item.relativePath isEqualToString:@"session/session.db"]) sessions.database = item;
+    }
+
+    self.rootNodes = @[chatGroup, contacts, sessions];
+    [self ym_resetDataPane];
+    [self.outlineView reloadData];
+    [self ym_rebuildRowsColumns];
+    [self ym_updateLoadMoreButton];
+    [self.outlineView expandItem:chatGroup];
+    self.statusField.stringValue = @"正在整理会话与联系人 …";
+
+    dispatch_async(self.workQueue, ^{
+        // 1) 联系人映射 username → 显示名
+        NSMutableDictionary<NSString *, NSString *> *names = [NSMutableDictionary dictionary];
+        for (YMDbBrowserDatabaseItem *item in items) {
+            if (![item.relativePath isEqualToString:@"contact/contact.db"]) continue;
+            NSString *error = nil;
+            NSString *decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error, NO);
+            if (!decrypted) break;
+            NSDictionary *result = ym_sqlite_query(decrypted,
+                @"SELECT username, remark, nick_name FROM contact WHERE delete_flag=0", nil);
+            for (NSArray *row in result[@"rows"]) {
+                if (row.count < 3) continue;
+                NSString *username = row[0];
+                NSString *remark = row[1];
+                NSString *nick = row[2];
+                NSString *display = remark.length > 0 ? remark : (nick.length > 0 ? nick : username);
+                if (username.length > 0) names[username] = display;
+            }
+            break;
+        }
+
+        // 2) 枚举消息库的 Msg_<md5> 表，按 MD5(用户名) 反查归属
+        //    用户名全集 = 联系人 + 会话表 + Name2Id
+        NSMutableSet<NSString *> *usernames = [NSMutableSet setWithArray:names.allKeys];
+        NSMutableArray<YMDbTreeNode *> *conversations = [NSMutableArray array];
+        for (YMDbBrowserDatabaseItem *item in items) {
+            NSString *file = item.relativePath.lastPathComponent;
+            BOOL isMessageDb = [file hasPrefix:@"message_"] || [file hasPrefix:@"biz_message_"];
+            if (!isMessageDb || ![file hasSuffix:@".db"]) continue;
+            NSString *error = nil;
+            NSString *decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error, NO);
+            if (!decrypted) continue;
+            NSDictionary *tables = ym_sqlite_query(decrypted,
+                @"SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'", nil);
+            // 补充 Name2Id 用户名
+            NSDictionary *name2id = ym_sqlite_query(decrypted,
+                @"SELECT user_name FROM Name2Id", nil);
+            for (NSArray *row in name2id[@"rows"]) {
+                if (row.count > 0 && [(NSString *)row[0] length] > 0) {
+                    [usernames addObject:row[0]];
+                }
+            }
+            for (NSArray *row in tables[@"rows"]) {
+                NSString *table = row.count > 0 ? row[0] : nil;
+                if (![table isKindOfClass:[NSString class]] || table.length <= 4) continue;
+                NSString *md5 = [table substringFromIndex:4];
+                NSDictionary *stat = ym_sqlite_query(decrypted,
+                    [NSString stringWithFormat:@"SELECT count(*), max(create_time) FROM \"%@\"",
+                     ym_quote_identifier(table)], nil);
+                NSInteger count = 0;
+                NSInteger lastTime = 0;
+                NSArray *first = [stat[@"rows"] firstObject];
+                if ([first isKindOfClass:[NSArray class]] && first.count >= 2) {
+                    count = [first[0] integerValue];
+                    lastTime = [first[1] integerValue];
+                }
+                YMDbTreeNode *conversation = [[YMDbTreeNode alloc] init];
+                conversation.kind = YMDbTreeNodeConversation;
+                conversation.title = [NSString stringWithFormat:@"%@（%ld）", md5, (long)count];  // 先占位，稍后替换
+                conversation.expandable = NO;
+                conversation.database = item;
+                conversation.tableName = table;
+                conversation.tableCount = [NSString stringWithFormat:@"%ld", (long)count];
+                [conversations addObject:conversation];
+            }
+        }
+
+        // 3) 会话表用户名并入全集，然后把占位标题换成显示名
+        for (YMDbBrowserDatabaseItem *item in items) {
+            if (![item.relativePath isEqualToString:@"session/session.db"]) continue;
+            NSString *error = nil;
+            NSString *decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error, NO);
+            if (!decrypted) break;
+            NSDictionary *result = ym_sqlite_query(decrypted,
+                @"SELECT username FROM SessionTable", nil);
+            for (NSArray *row in result[@"rows"]) {
+                if (row.count > 0 && [(NSString *)row[0] length] > 0) {
+                    [usernames addObject:row[0]];
+                }
+            }
+            break;
+        }
+        NSMutableDictionary<NSString *, NSString *> *md5ToUsername = [NSMutableDictionary dictionary];
+        for (NSString *username in usernames) {
+            const char *s = username.UTF8String;
+            unsigned char digest[CC_MD5_DIGEST_LENGTH];
+            CC_MD5(s, (CC_LONG)strlen(s), digest);
+            char hex[33];
+            for (int i = 0; i < 16; i++) sprintf(hex + i * 2, "%02x", digest[i]);
+            hex[32] = 0;
+            md5ToUsername[[NSString stringWithUTF8String:hex]] = username;
+        }
+        for (YMDbTreeNode *conversation in conversations) {
+            NSString *md5 = [conversation.tableName substringFromIndex:4];
+            NSString *username = md5ToUsername[md5];
+            NSString *display = username ? ym_contact_display(username, names) : conversation.title;
+            if (username && [username isEqualToString:self.selfUsername]) display = @"我";
+            conversation.title = [NSString stringWithFormat:@"%@（%@）", display, conversation.tableCount];
+        }
+        [conversations sortUsingComparator:^NSComparisonResult(YMDbTreeNode *a, YMDbTreeNode *b) {
+            NSInteger diff = [b.tableCount integerValue] - [a.tableCount integerValue];
+            return diff > 0 ? NSOrderedDescending : (diff < 0 ? NSOrderedAscending : NSOrderedSame);
+        }];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.contactNames = names;
+            [chatGroup.children removeAllObjects];
+            [chatGroup.children addObjectsFromArray:conversations];
+            [self.outlineView reloadItem:chatGroup reloadChildren:YES];
+            [self.outlineView expandItem:chatGroup];
+            self.statusField.stringValue = [NSString stringWithFormat:
+                @"简易模式：%lu 个会话、%lu 个联系人（点击左侧查看，专业模式可浏览全部原始表）",
+                (unsigned long)conversations.count, (unsigned long)names.count];
+        });
+    });
 }
 
 // 首次展开数据库节点时懒加载表列表
@@ -673,12 +932,70 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 
 #pragma mark 行数据分页
 
+// 依据节点类型构造查询 SQL（分页统一 LIMIT/OFFSET）
+- (NSString *)ym_sqlForNode:(YMDbTreeNode *)node offset:(NSInteger)offset
+{
+    NSString *page = [NSString stringWithFormat:@" LIMIT %lu OFFSET %ld",
+                      (unsigned long)kYMBMaxRows, (long)offset];
+    switch (node.kind) {
+        case YMDbTreeNodeConversation:
+            return [[NSString stringWithFormat:
+                @"SELECT m.create_time AS 时间, COALESCE(n.user_name, CAST(m.real_sender_id AS TEXT)) AS 发送者,"
+                @" m.local_type AS 类型, m.message_content AS 内容"
+                @" FROM \"%@\" m LEFT JOIN Name2Id n ON m.real_sender_id = n.rowid"
+                @" ORDER BY m.sort_seq DESC", ym_quote_identifier(node.tableName)]
+                stringByAppendingString:page];
+        case YMDbTreeNodeContactsOverview:
+            return [@"SELECT remark AS 备注, nick_name AS 昵称, username AS 用户名, alias AS 微信号"
+                    @" FROM contact WHERE delete_flag=0 ORDER BY username"
+                stringByAppendingString:page];
+        case YMDbTreeNodeSessionsOverview:
+            return [@"SELECT username AS 用户, unread_count AS 未读, summary AS 摘要, last_timestamp AS 最后时间"
+                    @" FROM SessionTable ORDER BY sort_timestamp DESC"
+                stringByAppendingString:page];
+        default:
+            return [NSString stringWithFormat:@"SELECT * FROM \"%@\"%@",
+                    ym_quote_identifier(node.tableName), page];
+    }
+}
+
+// 简易模式的结果按人类可读格式转换（时间/发送者/类型）
+- (NSArray<NSArray<NSString *> *> *)ym_formatSimpleRows:(NSArray<NSArray<NSString *> *> *)rows
+{
+    NSMutableArray *formatted = [NSMutableArray arrayWithCapacity:rows.count];
+    for (NSArray *row in rows) {
+        NSMutableArray *cells = [NSMutableArray arrayWithCapacity:row.count];
+        for (NSUInteger i = 0; i < row.count; i++) {
+            NSString *cell = row[i];
+            if ([cell isKindOfClass:[NSString class]]) {
+                if (i == 0 && cell.length > 0 && [cell longLongValue] > 0) {
+                    cell = ym_format_timestamp([cell longLongValue]);
+                } else if (i == 1 && cell.length > 0) {
+                    NSString *username = cell;
+                    NSString *display = ym_contact_display(username, self.contactNames);
+                    if ([username isEqualToString:self.selfUsername]) display = @"我";
+                    cell = display;
+                } else if (i == 2 && cell.length > 0) {
+                    cell = ym_local_type_label([cell integerValue]);
+                }
+            }
+            [cells addObject:cell ?: @""];
+        }
+        [formatted addObject:cells];
+    }
+    return formatted;
+}
+
 - (void)ym_showTableNode:(YMDbTreeNode *)tableNode
 {
+    self.currentNode = tableNode;
     self.currentDatabase = tableNode.database;
     self.currentTableName = tableNode.tableName;
     self.currentTableTotal = -1;
-    if ([tableNode.tableCount isKindOfClass:[NSString class]]) {
+    if (tableNode.kind == YMDbTreeNodeContactsOverview ||
+        tableNode.kind == YMDbTreeNodeSessionsOverview) {
+        self.currentTableTotal = -1;  // 总数未知，按满页判断是否可继续加载
+    } else if ([tableNode.tableCount isKindOfClass:[NSString class]]) {
         NSInteger total = [tableNode.tableCount integerValue];
         if (total >= 0) self.currentTableTotal = total;
     }
@@ -698,13 +1015,16 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 
 - (void)ym_loadNextRowsPage
 {
-    if (!self.currentDatabase || self.currentTableName.length == 0) return;
+    YMDbTreeNode *node = self.currentNode;
+    if (!node || !node.database) return;
     if (self.currentTableTotal >= 0 && self.rowsLoaded >= self.currentTableTotal) return;
-    YMDbBrowserDatabaseItem *item = self.currentDatabase;
-    NSString *tableName = self.currentTableName;
+    YMDbBrowserDatabaseItem *item = node.database;
+    NSString *tableName = node.tableName;
     NSInteger offset = self.rowsLoaded;
+    NSString *reading = node.kind == YMDbTreeNodeConversation
+        ? node.title : (tableName ?: node.title ?: @"");
     self.statusField.stringValue = [NSString stringWithFormat:@"正在读取 %@（已加载 %ld 行）…",
-                                    tableName, (long)offset];
+                                    reading, (long)offset];
     self.loadMoreButton.enabled = NO;
 
     dispatch_async(self.workQueue, ^{
@@ -714,9 +1034,7 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
             error = nil;
             NSString *decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error, attempt > 0);
             if (!decrypted) break;
-            NSString *sql = [NSString stringWithFormat:@"SELECT * FROM \"%@\" LIMIT %lu OFFSET %ld",
-                             ym_quote_identifier(tableName), (unsigned long)kYMBMaxRows, (long)offset];
-            result = ym_sqlite_query(decrypted, sql, &error);
+            result = ym_sqlite_query(decrypted, [self ym_sqlForNode:node offset:offset], &error);
             if (!result && attempt == 0 && ym_error_looks_corrupt(error)) {
                 os_log_error(ym_db_browser_log(), "rows query corrupt, retry fresh: %{public}@", error);
                 continue;  // 撕裂读：作废缓存重解一次
@@ -731,9 +1049,13 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
             }
             NSArray *fetchedColumns = result[@"columns"];
             NSArray *fetchedRows = result[@"rows"];
-            BOOL sameTable = [self.currentDatabase isEqual:item] &&
-                             [self.currentTableName isEqualToString:tableName];
-            if (!sameTable) return;  // 选择已切换，丢弃过期结果
+            if (node.kind == YMDbTreeNodeConversation ||
+                node.kind == YMDbTreeNodeSessionsOverview ||
+                node.kind == YMDbTreeNodeContactsOverview) {
+                fetchedRows = [self ym_formatSimpleRows:fetchedRows];
+            }
+            BOOL sameNode = self.currentNode == node;
+            if (!sameNode) return;  // 选择已切换，丢弃过期结果
             if (offset == 0) {
                 self.columns = fetchedColumns;
                 self.rows = [NSMutableArray arrayWithArray:fetchedRows];
@@ -750,8 +1072,8 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
             [self ym_updateLoadMoreButton];
             NSString *total = self.currentTableTotal >= 0
                 ? [NSString stringWithFormat:@" / 共 %ld 行", (long)self.currentTableTotal] : @"";
-            self.statusField.stringValue = [NSString stringWithFormat:@"%@ · %@　已加载 %ld 行%@　（可横向滚动查看全部列）",
-                item.relativePath, tableName, (long)self.rowsLoaded, total];
+            self.statusField.stringValue = [NSString stringWithFormat:@"%@　已加载 %ld 行%@　（可横向滚动查看全部列）",
+                reading, (long)self.rowsLoaded, total];
         });
     });
 }
@@ -831,8 +1153,12 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     NSInteger row = self.outlineView.selectedRow;
     if (row < 0) return;
     YMDbTreeNode *node = [self.outlineView itemAtRow:row];
-    if ([node isKindOfClass:[YMDbTreeNode class]] && node.kind == YMDbTreeNodeTable) {
-        [self ym_showTableNode:node];
+    if (![node isKindOfClass:[YMDbTreeNode class]]) return;
+    if (node.kind == YMDbTreeNodeTable ||
+        node.kind == YMDbTreeNodeConversation ||
+        node.kind == YMDbTreeNodeContactsOverview ||
+        node.kind == YMDbTreeNodeSessionsOverview) {
+        if (node.database) [self ym_showTableNode:node];
     }
 }
 

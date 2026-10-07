@@ -789,7 +789,6 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
         [previewTitle.topAnchor constraintEqualToAnchor:previewPane.topAnchor],
         [previewTitle.leadingAnchor constraintEqualToAnchor:previewPane.leadingAnchor constant:4],
         [previewTitle.heightAnchor constraintEqualToConstant:20],
-        [previewScroll.topAnchor constraintEqualToAnchor:previewTitle.bottomAnchor constant:2],
         [previewScroll.leadingAnchor constraintEqualToAnchor:previewPane.leadingAnchor],
         [previewScroll.trailingAnchor constraintEqualToAnchor:previewPane.trailingAnchor],
         [previewScroll.bottomAnchor constraintEqualToAnchor:previewPane.bottomAnchor],

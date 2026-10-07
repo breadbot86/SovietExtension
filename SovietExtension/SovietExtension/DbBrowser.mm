@@ -4,7 +4,9 @@
 //
 //  Created by MustangYM on 2026/10/7.
 //
-//  数据库浏览器实现：
+//  数据库浏览器实现（树 + 数据网格，参照主流 SQLite 浏览器交互）：
+//  - 左侧 NSOutlineView 树：账号 ▶ 数据库 ▶ 表（表列表在首次展开时
+//    懒加载），点表在右侧加载行数据。
 //  - 解密：SQLCipher 原始密钥模式（pragma x'<key>' 的 32 字节即 AES-256 密钥）。
 //    每页 4096 字节，末尾 80 字节保留区 = IV(16) + HMAC-SHA512(64)，
 //    密文为页首 [0/16 : 4016]，CBC 无填充解密；首页前 16 字节为 salt，
@@ -13,8 +15,10 @@
 //    只回放最后一个 commit 帧之前的有效帧。
 //  - 解密副本缓存在 NSTemporaryDirectory()/SovietExtensionDbBrowser（0700），
 //    按源文件名+大小+mtime+密钥前缀生成缓存名；打开浏览器时清理 24h 前旧缓存。
-//  - 读取：libsqlite3 只读打开解密副本，所有 SQL 在串行后台队列执行，
-//    UI 更新回主队列。行数据最多展示 500 行。
+//  - 读取：libsqlite3 以 immutable=1 URI 只读打开（副本继承源库 WAL 模式
+//    文件头，普通只读连接会因无法建 -shm 报 unable to open database file），
+//    所有 SQL 在串行后台队列执行，UI 更新回主队列。行数据每页 500 行，
+//    「加载更多」翻页。
 //
 
 #import "DbBrowser.h"
@@ -295,7 +299,7 @@ static BOOL ym_error_looks_corrupt(NSString *error)
            [error rangeOfString:@"打开数据库失败"].location != NSNotFound;
 }
 
-#pragma mark - 浏览器窗口
+#pragma mark - 数据模型
 
 static NSString *ym_real_home(void)
 {
@@ -336,13 +340,43 @@ static NSString *ym_xwechat_files_root(void)
 }
 @end
 
-@interface DbBrowserWindowController : NSWindowController <NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate>
-@property (nonatomic, strong) NSArray<YMDbBrowserDatabaseItem *> *databases;
-@property (nonatomic, strong) NSArray<NSDictionary<NSString *, id> *> *tables;  // {name, count}
+// 树节点：账号(0) ▶ 数据库(1) ▶ 表(2)；9 用于「加载中/出错」占位
+typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
+    YMDbTreeNodeAccount = 0,
+    YMDbTreeNodeDatabase = 1,
+    YMDbTreeNodeTable = 2,
+    YMDbTreeNodePlaceholder = 9,
+};
+
+@interface YMDbTreeNode : NSObject
+@property (nonatomic, assign) YMDbTreeNodeKind kind;
+@property (nonatomic, copy) NSString *title;
+@property (nonatomic, strong) NSMutableArray<YMDbTreeNode *> *children;
+@property (nonatomic, assign) BOOL expandable;
+@property (nonatomic, assign) BOOL childrenLoaded;  // 数据库节点：表列表是否已加载
+@property (nonatomic, strong) YMDbBrowserDatabaseItem *database;  // 数据库/表节点
+@property (nonatomic, copy) NSString *tableName;                  // 表节点
+@property (nonatomic, copy) NSString *tableCount;                 // 表节点
+@end
+
+@implementation YMDbTreeNode
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        _children = [NSMutableArray array];
+    }
+    return self;
+}
+@end
+
+#pragma mark - 浏览器窗口
+
+@interface DbBrowserWindowController : NSWindowController <NSOutlineViewDataSource, NSOutlineViewDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate>
+@property (nonatomic, strong) NSArray<YMDbTreeNode *> *rootNodes;
 @property (nonatomic, strong) NSArray<NSString *> *columns;
 @property (nonatomic, strong) NSArray<NSArray<NSString *> *> *rows;
-@property (nonatomic, weak) NSTableView *databaseTable;
-@property (nonatomic, weak) NSTableView *tableTable;
+@property (nonatomic, weak) NSOutlineView *outlineView;
 @property (nonatomic, weak) NSTableView *rowsTable;
 @property (nonatomic, weak) NSButton *loadMoreButton;
 @property (nonatomic, weak) NSTextField *statusField;
@@ -371,8 +405,7 @@ static NSString *ym_xwechat_files_root(void)
     self = [super initWithWindow:window];
     if (self) {
         _workQueue = dispatch_queue_create("sovietextension.dbbrowser", DISPATCH_QUEUE_SERIAL);
-        _databases = @[];
-        _tables = @[];
+        _rootNodes = @[];
         _columns = @[];
         _rows = @[];
         [self ym_buildUI];
@@ -390,7 +423,7 @@ static NSString *ym_xwechat_files_root(void)
     split.dividerStyle = NSSplitViewDividerStyleThin;
     [content addSubview:split];
 
-    NSTextField *status = [NSTextField labelWithString:@"选择左侧数据库开始浏览"];
+    NSTextField *status = [NSTextField labelWithString:@"点击左侧 ▶ 展开数据库，选择表查看数据"];
     status.font = [NSFont systemFontOfSize:11];
     status.textColor = [NSColor secondaryLabelColor];
     status.lineBreakMode = NSLineBreakByTruncatingMiddle;
@@ -408,38 +441,44 @@ static NSString *ym_xwechat_files_root(void)
         [status.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-8],
     ]];
 
-    NSScrollView *dbScroll = [self ym_tableScrollView];
-    NSTableView *dbTable = dbScroll.documentView;
-    dbTable.dataSource = self;
-    dbTable.delegate = self;
-    dbTable.usesAlternatingRowBackgroundColors = YES;
-    _databaseTable = dbTable;
-    NSTableColumn *dbColumn = [[NSTableColumn alloc] initWithIdentifier:@"db"];
-    dbColumn.headerCell.stringValue = @"数据库";
-    dbColumn.width = 260;
-    dbColumn.resizingMask = NSTableColumnUserResizingMask | NSTableColumnAutoresizingMask;
-    [dbTable addTableColumn:dbColumn];
+    // 左：树（账号 ▶ 数据库 ▶ 表）
+    NSScrollView *treeScroll = [[NSScrollView alloc] init];
+    treeScroll.translatesAutoresizingMaskIntoConstraints = NO;
+    treeScroll.hasVerticalScroller = YES;
+    treeScroll.hasHorizontalScroller = YES;
+    treeScroll.autohidesScrollers = YES;
+    treeScroll.borderType = NSBezelBorder;
+    NSOutlineView *outline = [[NSOutlineView alloc] initWithFrame:NSZeroRect];
+    NSTableColumn *treeColumn = [[NSTableColumn alloc] initWithIdentifier:@"tree"];
+    treeColumn.width = 320;
+    treeColumn.resizingMask = NSTableColumnUserResizingMask | NSTableColumnAutoresizingMask;
+    [outline addTableColumn:treeColumn];
+    outline.outlineTableColumn = treeColumn;
+    outline.headerView = nil;
+    outline.rowHeight = 24;
+    outline.indentationPerLevel = 14;
+    outline.dataSource = self;
+    outline.delegate = self;
+    outline.usesAlternatingRowBackgroundColors = YES;
+    treeScroll.documentView = outline;
+    _outlineView = outline;
 
-    NSScrollView *tableScroll = [self ym_tableScrollView];
-    NSTableView *tableTable = tableScroll.documentView;
-    tableTable.dataSource = self;
-    tableTable.delegate = self;
-    tableTable.usesAlternatingRowBackgroundColors = YES;
-    _tableTable = tableTable;
-    NSTableColumn *tableColumn = [[NSTableColumn alloc] initWithIdentifier:@"table"];
-    tableColumn.headerCell.stringValue = @"表（行数）";
-    tableColumn.width = 230;
-    tableColumn.resizingMask = NSTableColumnUserResizingMask | NSTableColumnAutoresizingMask;
-    [tableTable addTableColumn:tableColumn];
-
-    NSScrollView *rowsScroll = [self ym_tableScrollView];
+    // 右：行数据 + 加载更多
+    NSScrollView *rowsScroll = [[NSScrollView alloc] init];
     rowsScroll.translatesAutoresizingMaskIntoConstraints = NO;
-    NSTableView *rowsTable = rowsScroll.documentView;
+    rowsScroll.hasVerticalScroller = YES;
+    rowsScroll.hasHorizontalScroller = YES;
+    rowsScroll.autohidesScrollers = YES;
+    rowsScroll.borderType = NSBezelBorder;
+    NSTableView *rowsTable = [[NSTableView alloc] initWithFrame:NSZeroRect];
+    rowsTable.rowHeight = 22;
     rowsTable.dataSource = self;
     rowsTable.delegate = self;
     rowsTable.usesAlternatingRowBackgroundColors = YES;
     // 列宽固定不随视口压缩，多列时靠横向滚动查看全部数据
     rowsTable.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
+    rowsTable.backgroundColor = [NSColor textBackgroundColor];
+    rowsScroll.documentView = rowsTable;
     _rowsTable = rowsTable;
 
     NSButton *loadMore = [NSButton buttonWithTitle:@"加载更多"
@@ -466,39 +505,23 @@ static NSString *ym_xwechat_files_root(void)
         [loadMore.heightAnchor constraintEqualToConstant:24],
     ]];
 
-    [split addArrangedSubview:dbScroll];
-    [split addArrangedSubview:tableScroll];
+    [split addArrangedSubview:treeScroll];
     [split addArrangedSubview:rowsPane];
-    [split setPosition:260 ofDividerAtIndex:0];
-    [split setPosition:520 ofDividerAtIndex:1];
-}
-
-- (NSScrollView *)ym_tableScrollView
-{
-    NSScrollView *scrollView = [[NSScrollView alloc] init];
-    NSTableView *tableView = [[NSTableView alloc] initWithFrame:NSZeroRect];
-    tableView.rowHeight = 22;
-    tableView.backgroundColor = [NSColor controlBackgroundColor];
-    scrollView.documentView = tableView;
-    scrollView.hasVerticalScroller = YES;
-    scrollView.hasHorizontalScroller = YES;
-    scrollView.autohidesScrollers = YES;
-    scrollView.borderType = NSBezelBorder;
-    return scrollView;
+    [split setPosition:320 ofDividerAtIndex:0];
 }
 
 - (void)showWindowCentered
 {
     ym_db_cache_cleanup();
-    [self ym_reloadDatabases];
+    [self ym_reloadTree];
     if (!self.window.isVisible) [self.window center];
     [NSApp activateIgnoringOtherApps:YES];
     [self.window makeKeyAndOrderFront:nil];
 }
 
-#pragma mark 数据加载
+#pragma mark 树加载
 
-- (void)ym_reloadDatabases
+- (void)ym_reloadTree
 {
     NSString *keysDir = YMKeyExportDirectory();
     NSString *root = ym_xwechat_files_root();
@@ -507,7 +530,7 @@ static NSString *ym_xwechat_files_root(void)
         return;
     }
 
-    NSMutableArray<YMDbBrowserDatabaseItem *> *items = [NSMutableArray array];
+    NSMutableArray<YMDbTreeNode *> *roots = [NSMutableArray array];
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *fileName in [fm contentsOfDirectoryAtPath:keysDir error:nil]) {
         if (![fileName.pathExtension isEqualToString:@"json"]) continue;
@@ -517,6 +540,14 @@ static NSString *ym_xwechat_files_root(void)
         if (![archive isKindOfClass:[NSDictionary class]]) continue;
         NSString *storage = [[root stringByAppendingPathComponent:account]
             stringByAppendingPathComponent:@"db_storage"];
+
+        YMDbTreeNode *accountNode = [[YMDbTreeNode alloc] init];
+        accountNode.kind = YMDbTreeNodeAccount;
+        accountNode.title = account;
+        accountNode.expandable = YES;
+        accountNode.childrenLoaded = YES;
+
+        NSMutableArray<YMDbBrowserDatabaseItem *> *items = [NSMutableArray array];
         for (NSString *rel in archive.allKeys) {
             if (![rel isKindOfClass:[NSString class]]) continue;
             NSDictionary *entry = archive[rel];
@@ -532,39 +563,52 @@ static NSString *ym_xwechat_files_root(void)
             item.keyHex = keyHex;
             [items addObject:item];
         }
+        [items sortUsingComparator:^NSComparisonResult(YMDbBrowserDatabaseItem *a, YMDbBrowserDatabaseItem *b) {
+            return [a.relativePath compare:b.relativePath];
+        }];
+        for (YMDbBrowserDatabaseItem *item in items) {
+            YMDbTreeNode *dbNode = [[YMDbTreeNode alloc] init];
+            dbNode.kind = YMDbTreeNodeDatabase;
+            dbNode.title = item.relativePath;
+            dbNode.expandable = YES;
+            dbNode.childrenLoaded = NO;
+            dbNode.database = item;
+            [accountNode.children addObject:dbNode];
+        }
+        if (accountNode.children.count > 0) [roots addObject:accountNode];
     }
-    [items sortUsingComparator:^NSComparisonResult(YMDbBrowserDatabaseItem *a, YMDbBrowserDatabaseItem *b) {
-        NSComparisonResult c = [a.account compare:b.account];
-        return c != NSOrderedSame ? c : [a.relativePath compare:b.relativePath];
-    }];
-    self.databases = items;
-    self.tables = @[];
+
+    self.rootNodes = roots;
     self.columns = @[];
     self.rows = @[];
     self.currentDatabase = nil;
     self.currentTableName = nil;
     self.currentTableTotal = -1;
     self.rowsLoaded = 0;
-    [self.databaseTable reloadData];
-    [self.tableTable reloadData];
+    [self.outlineView reloadData];
     [self ym_rebuildRowsColumns];
     [self ym_updateLoadMoreButton];
-    self.statusField.stringValue = items.count > 0
-        ? [NSString stringWithFormat:@"共 %lu 个数据库（含密钥存档）", (unsigned long)items.count]
+    for (YMDbTreeNode *node in roots) {
+        [self.outlineView expandItem:node];  // 默认展开账号层，数据库留待用户展开
+    }
+    self.statusField.stringValue = roots.count > 0
+        ? @"点击 ▶ 展开数据库，选择表查看数据"
         : @"密钥存档为空，请先执行「提取密钥」";
 }
 
-- (void)ym_loadTablesForSelection
+// 首次展开数据库节点时懒加载表列表
+- (void)ym_loadTablesForNode:(YMDbTreeNode *)dbNode
 {
-    NSInteger row = self.databaseTable.selectedRow;
-    if (row < 0 || row >= (NSInteger)self.databases.count) return;
-    YMDbBrowserDatabaseItem *item = self.databases[row];
+    YMDbBrowserDatabaseItem *item = dbNode.database;
+    if (!item) return;
+    YMDbTreeNode *placeholder = [[YMDbTreeNode alloc] init];
+    placeholder.kind = YMDbTreeNodePlaceholder;
+    placeholder.title = @"加载中…";
+    placeholder.expandable = NO;
+    [dbNode.children removeAllObjects];
+    [dbNode.children addObject:placeholder];
+    [self.outlineView reloadItem:dbNode reloadChildren:YES];
     self.statusField.stringValue = [NSString stringWithFormat:@"正在解密 %@ …", item.relativePath];
-    self.tables = @[];
-    self.columns = @[];
-    self.rows = @[];
-    [self.tableTable reloadData];
-    [self ym_rebuildRowsColumns];
 
     dispatch_async(self.workQueue, ^{
         NSString *error = nil;
@@ -577,12 +621,11 @@ static NSString *ym_xwechat_files_root(void)
             result = ym_sqlite_query(decrypted, @"SELECT name FROM sqlite_master "
                 "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name", &error);
             if (!result && attempt == 0 && ym_error_looks_corrupt(error)) {
-                os_log_error(ym_db_browser_log(), "table list corrupt, retry fresh: %{public}@",
-                             error);
+                os_log_error(ym_db_browser_log(), "table list corrupt, retry fresh: %{public}@", error);
                 continue;  // 撕裂读：作废缓存重解一次
             }
         }
-        NSMutableArray *tables = [NSMutableArray array];
+        NSMutableArray<YMDbTreeNode *> *tableNodes = [NSMutableArray array];
         if (result) {
             for (NSArray *row in result[@"rows"]) {
                 NSString *name = row.count > 0 ? row[0] : nil;
@@ -592,39 +635,51 @@ static NSString *ym_xwechat_files_root(void)
                 NSDictionary *counted = ym_sqlite_query(decrypted, countSql, nil);
                 NSString *count = (counted && [counted[@"rows"] count] > 0)
                     ? counted[@"rows"][0][0] : @"?";
-                [tables addObject:@{ @"name": name, @"count": count }];
+                YMDbTreeNode *tableNode = [[YMDbTreeNode alloc] init];
+                tableNode.kind = YMDbTreeNodeTable;
+                tableNode.title = [NSString stringWithFormat:@"%@（%@）", name, count];
+                tableNode.expandable = NO;
+                tableNode.database = item;
+                tableNode.tableName = name;
+                tableNode.tableCount = count;
+                [tableNodes addObject:tableNode];
             }
         } else {
             os_log_error(ym_db_browser_log(), "table list failed: %{public}@", error ?: @"unknown");
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSInteger selected = self.databaseTable.selectedRow;
-            if (selected < 0 || selected >= (NSInteger)self.databases.count ||
-                self.databases[selected] != item) {
-                return;  // 选择已切换，丢弃过期结果
+            [dbNode.children removeAllObjects];
+            [dbNode.children addObjectsFromArray:tableNodes];
+            dbNode.childrenLoaded = result ? YES : NO;  // 失败时保留占位提示，下次展开重试
+            if (!result) {
+                YMDbTreeNode *errorNode = [[YMDbTreeNode alloc] init];
+                errorNode.kind = YMDbTreeNodePlaceholder;
+                errorNode.title = [NSString stringWithFormat:@"加载失败：%@（收起重展开可重试）",
+                                   error ?: @"未知错误"];
+                errorNode.expandable = NO;
+                [dbNode.children addObject:errorNode];
             }
-            self.tables = tables;
-            [self.tableTable reloadData];
-            self.statusField.stringValue = result
-                ? [NSString stringWithFormat:@"%@　%lu 张表（数据即时解密，含最新 checkpoint）",
-                    item.displayName, (unsigned long)tables.count]
-                : (error ?: @"读取表失败");
+            [self.outlineView reloadItem:dbNode reloadChildren:YES];
+            if (result) {
+                [self.outlineView expandItem:dbNode];
+                self.statusField.stringValue = [NSString stringWithFormat:@"%@　%lu 张表（数据即时解密）",
+                    item.relativePath, (unsigned long)tableNodes.count];
+            } else {
+                self.statusField.stringValue = error ?: @"读取表失败";
+            }
         });
     });
 }
 
-- (void)ym_loadRowsForSelection
+#pragma mark 行数据分页
+
+- (void)ym_showTableNode:(YMDbTreeNode *)tableNode
 {
-    NSInteger tableRow = self.tableTable.selectedRow;
-    if (tableRow < 0 || tableRow >= (NSInteger)self.tables.count) return;
-    NSInteger dbRow = self.databaseTable.selectedRow;
-    if (dbRow < 0 || dbRow >= (NSInteger)self.databases.count) return;
-    self.currentDatabase = self.databases[dbRow];
-    self.currentTableName = self.tables[tableRow][@"name"];
+    self.currentDatabase = tableNode.database;
+    self.currentTableName = tableNode.tableName;
     self.currentTableTotal = -1;
-    NSString *countText = self.tables[tableRow][@"count"];
-    if ([countText isKindOfClass:[NSString class]]) {
-        NSInteger total = [countText integerValue];
+    if ([tableNode.tableCount isKindOfClass:[NSString class]]) {
+        NSInteger total = [tableNode.tableCount integerValue];
         if (total >= 0) self.currentTableTotal = total;
     }
     self.rowsLoaded = 0;
@@ -701,18 +756,6 @@ static NSString *ym_xwechat_files_root(void)
     });
 }
 
-- (void)ym_updateLoadMoreButton
-{
-    BOOL hasMore = self.currentTableTotal >= 0
-        ? (self.rowsLoaded < self.currentTableTotal)
-        : (self.rows.count >= kYMBMaxRows);  // 总数未知时按满页判断
-    self.loadMoreButton.hidden = (self.rows.count == 0) || !hasMore;
-    NSString *total = self.currentTableTotal >= 0
-        ? [NSString stringWithFormat:@" / %ld", (long)self.currentTableTotal] : @"";
-    [self.loadMoreButton setTitle:[NSString stringWithFormat:@"加载更多（已显示 %ld%@）",
-        (long)self.rows.count, total]];
-}
-
 - (void)ym_rebuildRowsColumns
 {
     while (self.rowsTable.numberOfColumns > 0) {
@@ -740,40 +783,73 @@ static NSString *ym_xwechat_files_root(void)
     [self.rowsTable reloadData];
 }
 
-#pragma mark NSTableViewDataSource / Delegate
+- (void)ym_updateLoadMoreButton
+{
+    BOOL hasMore = self.currentTableTotal >= 0
+        ? (self.rowsLoaded < self.currentTableTotal)
+        : (self.rows.count >= kYMBMaxRows);  // 总数未知时按满页判断
+    self.loadMoreButton.hidden = (self.rows.count == 0) || !hasMore;
+    NSString *total = self.currentTableTotal >= 0
+        ? [NSString stringWithFormat:@" / %ld", (long)self.currentTableTotal] : @"";
+    [self.loadMoreButton setTitle:[NSString stringWithFormat:@"加载更多（已显示 %ld%@）",
+        (long)self.rows.count, total]];
+}
+
+#pragma mark NSOutlineViewDataSource / Delegate
+
+- (NSInteger)outlineView:(NSOutlineView *)outlineView numberOfChildrenOfItem:(id)item
+{
+    return item ? ((YMDbTreeNode *)item).children.count : self.rootNodes.count;
+}
+
+- (id)outlineView:(NSOutlineView *)outlineView child:(NSInteger)index ofItem:(id)item
+{
+    return item ? ((YMDbTreeNode *)item).children[index] : self.rootNodes[index];
+}
+
+- (BOOL)outlineView:(NSOutlineView *)outlineView isItemExpandable:(id)item
+{
+    return ((YMDbTreeNode *)item).expandable;
+}
+
+- (id)outlineView:(NSOutlineView *)outlineView objectValueForTableColumn:(NSTableColumn *)tableColumn byItem:(id)item
+{
+    return ((YMDbTreeNode *)item).title;
+}
+
+- (BOOL)outlineView:(NSOutlineView *)outlineView shouldExpandItem:(id)item
+{
+    YMDbTreeNode *node = item;
+    if (node.kind == YMDbTreeNodeDatabase && !node.childrenLoaded) {
+        [self ym_loadTablesForNode:node];
+    }
+    return YES;
+}
+
+- (void)outlineViewSelectionDidChange:(NSNotification *)notification
+{
+    NSInteger row = self.outlineView.selectedRow;
+    if (row < 0) return;
+    YMDbTreeNode *node = [self.outlineView itemAtRow:row];
+    if ([node isKindOfClass:[YMDbTreeNode class]] && node.kind == YMDbTreeNodeTable) {
+        [self ym_showTableNode:node];
+    }
+}
+
+#pragma mark NSTableViewDataSource / Delegate（行数据）
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
 {
-    if (tableView == self.databaseTable) return self.databases.count;
-    if (tableView == self.tableTable) return self.tables.count;
     return self.rows.count;
 }
 
 - (id)tableView:(NSTableView *)tableView objectValueForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row
 {
-    if (tableView == self.databaseTable) {
-        return row < (NSInteger)self.databases.count ? self.databases[row].displayName : @"";
-    }
-    if (tableView == self.tableTable) {
-        if (row >= (NSInteger)self.tables.count) return @"";
-        NSDictionary *table = self.tables[row];
-        return [NSString stringWithFormat:@"%@（%@）", table[@"name"], table[@"count"]];
-    }
     NSUInteger column = [self.columns indexOfObject:tableColumn.identifier];
     if (column == NSNotFound || column >= self.columns.count) return @"";
     if (row < 0 || row >= (NSInteger)self.rows.count) return @"";
     NSArray *cells = self.rows[row];
     return column < cells.count ? cells[column] : @"";
-}
-
-- (void)tableViewSelectionDidChange:(NSNotification *)notification
-{
-    NSTableView *tableView = notification.object;
-    if (tableView == self.databaseTable) {
-        [self ym_loadTablesForSelection];
-    } else if (tableView == self.tableTable) {
-        [self ym_loadRowsForSelection];
-    }
 }
 
 @end

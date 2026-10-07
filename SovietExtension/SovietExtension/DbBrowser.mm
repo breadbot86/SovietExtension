@@ -578,6 +578,7 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     YMDbTreeNodeConversation = 4,
     YMDbTreeNodeContactsOverview = 5,
     YMDbTreeNodeSessionsOverview = 6,
+    YMDbTreeNodeMiniPrograms = 7,
     YMDbTreeNodePlaceholder = 9,
 };
 
@@ -1021,12 +1022,17 @@ static NSString *ym_local_type_label(NSInteger type)
     sessions.kind = YMDbTreeNodeSessionsOverview;
     sessions.title = @"会话列表";
     sessions.expandable = NO;
+    YMDbTreeNode *miniPrograms = [[YMDbTreeNode alloc] init];
+    miniPrograms.kind = YMDbTreeNodeMiniPrograms;
+    miniPrograms.title = @"小程序";
+    miniPrograms.expandable = NO;
     for (YMDbBrowserDatabaseItem *item in items) {
         if ([item.relativePath isEqualToString:@"contact/contact.db"]) contacts.database = item;
         if ([item.relativePath isEqualToString:@"session/session.db"]) sessions.database = item;
+        if ([item.relativePath isEqualToString:@"general/general.db"]) miniPrograms.database = item;
     }
 
-    self.rootNodes = @[chatGroup, contacts, sessions];
+    self.rootNodes = @[chatGroup, contacts, sessions, miniPrograms];
     [self ym_resetDataPane];
     [self.outlineView reloadData];
     [self ym_rebuildRowsColumns];
@@ -1252,6 +1258,11 @@ static NSString *ym_local_type_label(NSInteger type)
             return [@"SELECT username AS 用户, unread_count AS 未读, summary AS 摘要, last_timestamp AS 最后时间"
                     @" FROM SessionTable ORDER BY sort_timestamp DESC"
                 stringByAppendingString:page];
+        case YMDbTreeNodeMiniPrograms:
+            // Mac 微信不运行小程序，本地仅有账号级同步记录（gh ID + 时间）
+            return [@"SELECT user_name AS 小程序, last_update_time AS 最近活跃"
+                    @" FROM WeAppBizAttrSyncBufferTableV02 ORDER BY last_update_time DESC"
+                stringByAppendingString:page];
         default:
             if (node.tableIsView) {
                 return [NSString stringWithFormat:@"SELECT * FROM \"%@\"%@",
@@ -1355,7 +1366,8 @@ static NSString *ym_local_type_label(NSInteger type)
             NSArray *fetchedRows = result[@"rows"];
             if (node.kind == YMDbTreeNodeConversation ||
                 node.kind == YMDbTreeNodeSessionsOverview ||
-                node.kind == YMDbTreeNodeContactsOverview) {
+                node.kind == YMDbTreeNodeContactsOverview ||
+                node.kind == YMDbTreeNodeMiniPrograms) {
                 fetchedRows = [self ym_formatSimpleRows:fetchedRows];
             }
             BOOL sameNode = self.currentNode == node;
@@ -1463,7 +1475,8 @@ static NSString *ym_local_type_label(NSInteger type)
     if (node.kind == YMDbTreeNodeTable ||
         node.kind == YMDbTreeNodeConversation ||
         node.kind == YMDbTreeNodeContactsOverview ||
-        node.kind == YMDbTreeNodeSessionsOverview) {
+        node.kind == YMDbTreeNodeSessionsOverview ||
+        node.kind == YMDbTreeNodeMiniPrograms) {
         if (node.database) [self ym_showTableNode:node];
     } else if (node.kind == YMDbTreeNodeDatabase && !node.childrenLoaded) {
         [self ym_loadTablesForNode:node];  // 点数据库行同样进入（不必点 ▶）

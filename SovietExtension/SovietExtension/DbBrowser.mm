@@ -21,6 +21,7 @@
 #import "KeyExporter.h"
 #import <Cocoa/Cocoa.h>
 #import <CommonCrypto/CommonCrypto.h>
+#import <os/log.h>
 #import <sqlite3.h>
 
 #pragma mark - 解密
@@ -97,13 +98,31 @@ static void ym_db_cache_cleanup(void)
     }
 }
 
+static NSString *ym_db_cache_path(NSString *dbPath, NSString *keyHex)
+{
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:dbPath error:nil];
+    unsigned long long fileSize = [attrs fileSize];
+    NSDate *mtime = [attrs objectForKey:NSFileModificationDate];
+    NSString *cacheName = [NSString stringWithFormat:@"%@-%llu-%.0f-%@.db",
+        dbPath.lastPathComponent, fileSize, mtime ? mtime.timeIntervalSince1970 : 0,
+        [keyHex substringToIndex:8]];
+    return [ym_db_cache_directory() stringByAppendingPathComponent:cacheName];
+}
+
 // 解密 dbPath（含 WAL 回放）到缓存副本；成功返回缓存路径，失败返回 nil 并给出原因。
-static NSString *ym_decrypt_database(NSString *dbPath, NSString *keyHex, NSString **outError)
+// forceFresh 为 YES 时先作废既有缓存（用于撕裂读导致副本损坏后的自愈重试）。
+static NSString *ym_decrypt_database(NSString *dbPath, NSString *keyHex, NSString **outError, BOOL forceFresh)
 {
     unsigned char key[32];
     if (!ym_hex_to_key(keyHex, key)) {
         if (outError) *outError = @"密钥格式无效";
         return nil;
+    }
+    NSString *cachePath = ym_db_cache_path(dbPath, keyHex);
+    if (forceFresh) {
+        [[NSFileManager defaultManager] removeItemAtPath:cachePath error:nil];
+    } else if ([[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
+        return cachePath;
     }
     NSError *readError = nil;
     NSData *encrypted = [NSData dataWithContentsOfFile:dbPath
@@ -117,15 +136,6 @@ static NSString *ym_decrypt_database(NSString *dbPath, NSString *keyHex, NSStrin
         encrypted = [encrypted subdataWithRange:
             NSMakeRange(0, encrypted.length / kYMBPage * kYMBPage)];
     }
-
-    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:dbPath error:nil];
-    unsigned long long fileSize = [attrs fileSize];
-    NSDate *mtime = [attrs objectForKey:NSFileModificationDate];
-    NSString *cacheName = [NSString stringWithFormat:@"%@-%llu-%.0f-%@.db",
-        dbPath.lastPathComponent, fileSize, mtime ? mtime.timeIntervalSince1970 : 0,
-        [keyHex substringToIndex:8]];
-    NSString *cachePath = [ym_db_cache_directory() stringByAppendingPathComponent:cacheName];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:cachePath]) return cachePath;
 
     NSMutableData *plain = [encrypted mutableCopy];
     size_t nPages = encrypted.length / kYMBPage;
@@ -257,6 +267,25 @@ static NSDictionary *ym_sqlite_query(NSString *databasePath, NSString *sql, NSSt
 static NSString *ym_quote_identifier(NSString *identifier)
 {
     return [identifier stringByReplacingOccurrencesOfString:@"\"" withString:@"\"\""];
+}
+
+static os_log_t ym_db_browser_log(void)
+{
+    static os_log_t log;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        log = os_log_create("SovietExtension", "DbBrowser");
+    });
+    return log;
+}
+
+// 错误是否疑似「主文件与 WAL 撕裂读导致副本内部不一致」——可作废缓存重解自愈
+static BOOL ym_error_looks_corrupt(NSString *error)
+{
+    if (error.length == 0) return NO;
+    return [error rangeOfString:@"malformed"].location != NSNotFound ||
+           [error rangeOfString:@"not a database"].location != NSNotFound ||
+           [error rangeOfString:@"打开数据库失败"].location != NSNotFound;
 }
 
 #pragma mark - 浏览器窗口
@@ -532,16 +561,20 @@ static NSString *ym_xwechat_files_root(void)
 
     dispatch_async(self.workQueue, ^{
         NSString *error = nil;
-        NSString *decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error);
-        if (!decrypted) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                self.statusField.stringValue = error ?: @"解密失败";
-            });
-            return;
+        NSDictionary *result = nil;
+        NSString *decrypted = nil;
+        for (int attempt = 0; attempt < 2 && !result; attempt++) {
+            error = nil;
+            decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error, attempt > 0);
+            if (!decrypted) break;
+            result = ym_sqlite_query(decrypted, @"SELECT name FROM sqlite_master "
+                "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name", &error);
+            if (!result && attempt == 0 && ym_error_looks_corrupt(error)) {
+                os_log_error(ym_db_browser_log(), "table list corrupt, retry fresh: %{public}@",
+                             error);
+                continue;  // 撕裂读：作废缓存重解一次
+            }
         }
-        NSString *sql = @"SELECT name FROM sqlite_master "
-                        "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name";
-        NSDictionary *result = ym_sqlite_query(decrypted, sql, &error);
         NSMutableArray *tables = [NSMutableArray array];
         if (result) {
             for (NSArray *row in result[@"rows"]) {
@@ -554,8 +587,15 @@ static NSString *ym_xwechat_files_root(void)
                     ? counted[@"rows"][0][0] : @"?";
                 [tables addObject:@{ @"name": name, @"count": count }];
             }
+        } else {
+            os_log_error(ym_db_browser_log(), "table list failed: %{public}@", error ?: @"unknown");
         }
         dispatch_async(dispatch_get_main_queue(), ^{
+            NSInteger selected = self.databaseTable.selectedRow;
+            if (selected < 0 || selected >= (NSInteger)self.databases.count ||
+                self.databases[selected] != item) {
+                return;  // 选择已切换，丢弃过期结果
+            }
             self.tables = tables;
             [self.tableTable reloadData];
             self.statusField.stringValue = result
@@ -607,20 +647,23 @@ static NSString *ym_xwechat_files_root(void)
 
     dispatch_async(self.workQueue, ^{
         NSString *error = nil;
-        NSString *decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error);
-        if (!decrypted) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                self.statusField.stringValue = error ?: @"解密失败";
-                self.loadMoreButton.enabled = YES;
-            });
-            return;
+        NSDictionary *result = nil;
+        for (int attempt = 0; attempt < 2 && !result; attempt++) {
+            error = nil;
+            NSString *decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error, attempt > 0);
+            if (!decrypted) break;
+            NSString *sql = [NSString stringWithFormat:@"SELECT * FROM \"%@\" LIMIT %lu OFFSET %ld",
+                             ym_quote_identifier(tableName), (unsigned long)kYMBMaxRows, (long)offset];
+            result = ym_sqlite_query(decrypted, sql, &error);
+            if (!result && attempt == 0 && ym_error_looks_corrupt(error)) {
+                os_log_error(ym_db_browser_log(), "rows query corrupt, retry fresh: %{public}@", error);
+                continue;  // 撕裂读：作废缓存重解一次
+            }
         }
-        NSString *sql = [NSString stringWithFormat:@"SELECT * FROM \"%@\" LIMIT %lu OFFSET %ld",
-                         ym_quote_identifier(tableName), (unsigned long)kYMBMaxRows, (long)offset];
-        NSDictionary *result = ym_sqlite_query(decrypted, sql, &error);
         dispatch_async(dispatch_get_main_queue(), ^{
             self.loadMoreButton.enabled = YES;
             if (!result) {
+                os_log_error(ym_db_browser_log(), "rows query failed: %{public}@", error ?: @"unknown");
                 self.statusField.stringValue = error ?: @"查询失败";
                 return;
             }

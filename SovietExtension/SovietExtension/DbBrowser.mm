@@ -1018,7 +1018,8 @@ static NSString *ym_local_type_label(NSInteger type)
 {
     YMDbTreeNode *node = self.currentNode;
     if (!node || !node.database) return;
-    if (self.currentTableTotal >= 0 && self.rowsLoaded >= self.currentTableTotal) return;
+    if (self.rowsLoaded > 0 && self.currentTableTotal >= 0 &&
+        self.rowsLoaded >= self.currentTableTotal) return;
     YMDbBrowserDatabaseItem *item = node.database;
     NSString *tableName = node.tableName;
     NSInteger offset = self.rowsLoaded;
@@ -1071,6 +1072,8 @@ static NSString *ym_local_type_label(NSInteger type)
             }
             self.rowsLoaded += fetchedRows.count;
             [self ym_updateLoadMoreButton];
+            os_log(ym_db_browser_log(), "loaded page: %ld rows, offset was %ld",
+                   (long)fetchedRows.count, (long)offset);
             NSString *total = self.currentTableTotal >= 0
                 ? [NSString stringWithFormat:@" / 共 %ld 行", (long)self.currentTableTotal] : @"";
             self.statusField.stringValue = [NSString stringWithFormat:@"%@　已加载 %ld 行%@　（可横向滚动查看全部列）",
@@ -1160,6 +1163,8 @@ static NSString *ym_local_type_label(NSInteger type)
         node.kind == YMDbTreeNodeContactsOverview ||
         node.kind == YMDbTreeNodeSessionsOverview) {
         if (node.database) [self ym_showTableNode:node];
+    } else if (node.kind == YMDbTreeNodeDatabase && !node.childrenLoaded) {
+        [self ym_loadTablesForNode:node];  // 点数据库行同样进入（不必点 ▶）
     }
 }
 

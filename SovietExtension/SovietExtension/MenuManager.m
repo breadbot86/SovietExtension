@@ -14,6 +14,7 @@
 #import "SidebarManager.h"
 #import "SidebarSettingsWindowController.h"
 #import "KeyExporter.h"
+#import "DbBrowser.h"
 #import <objc/runtime.h>
 
 #ifndef kExitChatroomNickname
@@ -151,6 +152,13 @@ static void YMProtectAssistantMenuRole(void) {
                                                          state:NO];
     extractKeysMenu.toolTip = @"在本进程内存中提取数据库密钥并按 wxid 存档；已提取过会自动跳过。";
 
+    NSMenuItem *dbBrowserMenu = [NSMenuItem menuItemWithTitle:@"数据库浏览器"
+                                                       action:@selector(onBrowseDatabases:)
+                                                       target:self
+                                                keyEquivalent:@""
+                                                        state:NO];
+    dbBrowserMenu.toolTip = @"用已提取的密钥解密并浏览数据库；未提取密钥时不可用。";
+
 
     NSMenuItem *themeMenu = [self ym_createThemeModeMenu];
     NSMenuItem *sidebarMenu = [self ym_createSidebarMenu];
@@ -174,6 +182,7 @@ static void YMProtectAssistantMenuRole(void) {
         useSystemWebMenu,
         newWeChatMenu,
         extractKeysMenu,
+        dbBrowserMenu,
         currentVersionMenu
     ]];
     
@@ -286,6 +295,21 @@ static void YMProtectAssistantMenuRole(void) {
         [alert addButtonWithTitle:@"确定"];
         [alert runModal];
     });
+}
+
+- (void)onBrowseDatabases:(NSMenuItem *)item
+{
+    (void)item;
+    YMShowDatabaseBrowser();
+}
+
+// 数据库浏览器仅在已有密钥存档时可用；其余菜单项始终可用。
+- (BOOL)validateMenuItem:(NSMenuItem *)item
+{
+    if (item.action == @selector(onBrowseDatabases:)) {
+        return YMKeyExportHasKeys();
+    }
+    return YES;
 }
 
 

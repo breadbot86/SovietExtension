@@ -187,6 +187,7 @@
 					ImageIO,
 					"-framework",
 					UniformTypeIdentifiers,
+					"-lsqlite3",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.mustangym.SovietExtension;
 				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";
@@ -227,6 +228,7 @@
 					ImageIO,
 					"-framework",
 					UniformTypeIdentifiers,
+					"-lsqlite3",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.mustangym.SovietExtension;
 				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";

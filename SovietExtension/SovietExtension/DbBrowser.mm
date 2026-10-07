@@ -441,6 +441,7 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 
     NSSplitView *split = [[NSSplitView alloc] init];
     split.translatesAutoresizingMaskIntoConstraints = NO;
+    split.vertical = YES;  // 左右分栏（默认为上下分割）
     split.dividerStyle = NSSplitViewDividerStyleThin;
     [content addSubview:split];
 

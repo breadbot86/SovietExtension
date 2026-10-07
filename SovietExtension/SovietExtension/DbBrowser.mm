@@ -308,8 +308,13 @@ static NSString *ym_xwechat_files_root(void)
 @property (nonatomic, weak) NSTableView *databaseTable;
 @property (nonatomic, weak) NSTableView *tableTable;
 @property (nonatomic, weak) NSTableView *rowsTable;
+@property (nonatomic, weak) NSButton *loadMoreButton;
 @property (nonatomic, weak) NSTextField *statusField;
 @property (nonatomic, strong) dispatch_queue_t workQueue;
+@property (nonatomic, strong) YMDbBrowserDatabaseItem *currentDatabase;
+@property (nonatomic, copy) NSString *currentTableName;
+@property (nonatomic, assign) NSInteger currentTableTotal;  // -1 未知
+@property (nonatomic, assign) NSInteger rowsLoaded;
 - (void)showWindowCentered;
 @end
 
@@ -392,15 +397,42 @@ static NSString *ym_xwechat_files_root(void)
     [tableTable addTableColumn:tableColumn];
 
     NSScrollView *rowsScroll = [self ym_tableScrollView];
+    rowsScroll.translatesAutoresizingMaskIntoConstraints = NO;
     NSTableView *rowsTable = rowsScroll.documentView;
     rowsTable.dataSource = self;
     rowsTable.delegate = self;
     rowsTable.usesAlternatingRowBackgroundColors = YES;
+    // 列宽固定不随视口压缩，多列时靠横向滚动查看全部数据
+    rowsTable.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
     _rowsTable = rowsTable;
+
+    NSButton *loadMore = [NSButton buttonWithTitle:@"加载更多"
+                                            target:self
+                                            action:@selector(ym_loadMoreRows:)];
+    loadMore.translatesAutoresizingMaskIntoConstraints = NO;
+    loadMore.bezelStyle = NSBezelStyleRounded;
+    loadMore.controlSize = NSControlSizeSmall;
+    loadMore.font = [NSFont systemFontOfSize:11];
+    loadMore.hidden = YES;
+    _loadMoreButton = loadMore;
+
+    NSView *rowsPane = [[NSView alloc] init];
+    rowsPane.translatesAutoresizingMaskIntoConstraints = NO;
+    [rowsPane addSubview:rowsScroll];
+    [rowsPane addSubview:loadMore];
+    [NSLayoutConstraint activateConstraints:@[
+        [rowsScroll.topAnchor constraintEqualToAnchor:rowsPane.topAnchor],
+        [rowsScroll.leadingAnchor constraintEqualToAnchor:rowsPane.leadingAnchor],
+        [rowsScroll.trailingAnchor constraintEqualToAnchor:rowsPane.trailingAnchor],
+        [rowsScroll.bottomAnchor constraintEqualToAnchor:loadMore.topAnchor constant:-6],
+        [loadMore.leadingAnchor constraintEqualToAnchor:rowsPane.leadingAnchor],
+        [loadMore.bottomAnchor constraintEqualToAnchor:rowsPane.bottomAnchor],
+        [loadMore.heightAnchor constraintEqualToConstant:24],
+    ]];
 
     [split addArrangedSubview:dbScroll];
     [split addArrangedSubview:tableScroll];
-    [split addArrangedSubview:rowsScroll];
+    [split addArrangedSubview:rowsPane];
     [split setPosition:260 ofDividerAtIndex:0];
     [split setPosition:520 ofDividerAtIndex:1];
 }
@@ -473,9 +505,14 @@ static NSString *ym_xwechat_files_root(void)
     self.tables = @[];
     self.columns = @[];
     self.rows = @[];
+    self.currentDatabase = nil;
+    self.currentTableName = nil;
+    self.currentTableTotal = -1;
+    self.rowsLoaded = 0;
     [self.databaseTable reloadData];
     [self.tableTable reloadData];
     [self ym_rebuildRowsColumns];
+    [self ym_updateLoadMoreButton];
     self.statusField.stringValue = items.count > 0
         ? [NSString stringWithFormat:@"共 %lu 个数据库（含密钥存档）", (unsigned long)items.count]
         : @"密钥存档为空，请先执行「提取密钥」";
@@ -533,14 +570,40 @@ static NSString *ym_xwechat_files_root(void)
 {
     NSInteger tableRow = self.tableTable.selectedRow;
     if (tableRow < 0 || tableRow >= (NSInteger)self.tables.count) return;
-    NSString *tableName = self.tables[tableRow][@"name"];
     NSInteger dbRow = self.databaseTable.selectedRow;
     if (dbRow < 0 || dbRow >= (NSInteger)self.databases.count) return;
-    YMDbBrowserDatabaseItem *item = self.databases[dbRow];
-    self.statusField.stringValue = [NSString stringWithFormat:@"正在读取 %@ …", tableName];
+    self.currentDatabase = self.databases[dbRow];
+    self.currentTableName = self.tables[tableRow][@"name"];
+    self.currentTableTotal = -1;
+    NSString *countText = self.tables[tableRow][@"count"];
+    if ([countText isKindOfClass:[NSString class]]) {
+        NSInteger total = [countText integerValue];
+        if (total >= 0) self.currentTableTotal = total;
+    }
+    self.rowsLoaded = 0;
     self.columns = @[];
     self.rows = @[];
     [self ym_rebuildRowsColumns];
+    [self ym_updateLoadMoreButton];
+    [self ym_loadNextRowsPage];
+}
+
+- (void)ym_loadMoreRows:(NSButton *)sender
+{
+    (void)sender;
+    [self ym_loadNextRowsPage];
+}
+
+- (void)ym_loadNextRowsPage
+{
+    if (!self.currentDatabase || self.currentTableName.length == 0) return;
+    if (self.currentTableTotal >= 0 && self.rowsLoaded >= self.currentTableTotal) return;
+    YMDbBrowserDatabaseItem *item = self.currentDatabase;
+    NSString *tableName = self.currentTableName;
+    NSInteger offset = self.rowsLoaded;
+    self.statusField.stringValue = [NSString stringWithFormat:@"正在读取 %@（已加载 %ld 行）…",
+                                    tableName, (long)offset];
+    self.loadMoreButton.enabled = NO;
 
     dispatch_async(self.workQueue, ^{
         NSString *error = nil;
@@ -548,27 +611,56 @@ static NSString *ym_xwechat_files_root(void)
         if (!decrypted) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.statusField.stringValue = error ?: @"解密失败";
+                self.loadMoreButton.enabled = YES;
             });
             return;
         }
-        NSString *sql = [NSString stringWithFormat:@"SELECT * FROM \"%@\" LIMIT %lu",
-                         ym_quote_identifier(tableName), (unsigned long)kYMBMaxRows];
+        NSString *sql = [NSString stringWithFormat:@"SELECT * FROM \"%@\" LIMIT %lu OFFSET %ld",
+                         ym_quote_identifier(tableName), (unsigned long)kYMBMaxRows, (long)offset];
         NSDictionary *result = ym_sqlite_query(decrypted, sql, &error);
         dispatch_async(dispatch_get_main_queue(), ^{
+            self.loadMoreButton.enabled = YES;
             if (!result) {
                 self.statusField.stringValue = error ?: @"查询失败";
                 return;
             }
-            self.columns = result[@"columns"];
-            self.rows = result[@"rows"];
-            [self ym_rebuildRowsColumns];
-            [self.rowsTable reloadData];
-            NSString *suffix = self.rows.count >= kYMBMaxRows
-                ? [NSString stringWithFormat:@"（仅展示前 %lu 行）", (unsigned long)kYMBMaxRows] : @"";
-            self.statusField.stringValue = [NSString stringWithFormat:@"%@ · %@　%lu 行%@",
-                item.relativePath, tableName, (unsigned long)self.rows.count, suffix];
+            NSArray *fetchedColumns = result[@"columns"];
+            NSArray *fetchedRows = result[@"rows"];
+            BOOL sameTable = [self.currentDatabase isEqual:item] &&
+                             [self.currentTableName isEqualToString:tableName];
+            if (!sameTable) return;  // 选择已切换，丢弃过期结果
+            if (offset == 0) {
+                self.columns = fetchedColumns;
+                self.rows = [NSMutableArray arrayWithArray:fetchedRows];
+                [self ym_rebuildRowsColumns];
+            } else if (fetchedColumns.count == self.columns.count) {
+                NSMutableArray *all = [NSMutableArray arrayWithArray:self.rows];
+                [all addObjectsFromArray:fetchedRows];
+                self.rows = all;
+                [self.rowsTable reloadData];
+            } else {
+                return;
+            }
+            self.rowsLoaded += fetchedRows.count;
+            [self ym_updateLoadMoreButton];
+            NSString *total = self.currentTableTotal >= 0
+                ? [NSString stringWithFormat:@" / 共 %ld 行", (long)self.currentTableTotal] : @"";
+            self.statusField.stringValue = [NSString stringWithFormat:@"%@ · %@　已加载 %ld 行%@　（可横向滚动查看全部列）",
+                item.relativePath, tableName, (long)self.rowsLoaded, total];
         });
     });
+}
+
+- (void)ym_updateLoadMoreButton
+{
+    BOOL hasMore = self.currentTableTotal >= 0
+        ? (self.rowsLoaded < self.currentTableTotal)
+        : (self.rows.count >= kYMBMaxRows);  // 总数未知时按满页判断
+    self.loadMoreButton.hidden = (self.rows.count == 0) || !hasMore;
+    NSString *total = self.currentTableTotal >= 0
+        ? [NSString stringWithFormat:@" / %ld", (long)self.currentTableTotal] : @"";
+    [self.loadMoreButton setTitle:[NSString stringWithFormat:@"加载更多（已显示 %ld%@）",
+        (long)self.rows.count, total]];
 }
 
 - (void)ym_rebuildRowsColumns

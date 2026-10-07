@@ -13,6 +13,7 @@
 #import "RevokeSettings.h"
 #import "SidebarManager.h"
 #import "SidebarSettingsWindowController.h"
+#import "KeyExporter.h"
 #import <objc/runtime.h>
 
 #ifndef kExitChatroomNickname
@@ -143,7 +144,14 @@ static void YMProtectAssistantMenuRole(void) {
                                                 keyEquivalent:@""
                                                         state:NO];
 
-    
+    NSMenuItem *extractKeysMenu = [NSMenuItem menuItemWithTitle:@"提取密钥"
+                                                        action:@selector(onExtractKeys:)
+                                                        target:self
+                                                 keyEquivalent:@""
+                                                         state:NO];
+    extractKeysMenu.toolTip = @"在本进程内存中提取数据库密钥并按 wxid 存档；已提取过会自动跳过。";
+
+
     NSMenuItem *themeMenu = [self ym_createThemeModeMenu];
     NSMenuItem *sidebarMenu = [self ym_createSidebarMenu];
    
@@ -165,6 +173,7 @@ static void YMProtectAssistantMenuRole(void) {
         autoLoginMenu,
         useSystemWebMenu,
         newWeChatMenu,
+        extractKeysMenu,
         currentVersionMenu
     ]];
     
@@ -265,6 +274,18 @@ static void YMProtectAssistantMenuRole(void) {
 - (void)onNewWeChat:(NSMenuItem *)item
 {
     [self executeShellCommand:@"open -n /Applications/WeChat.app"];
+}
+
+- (void)onExtractKeys:(NSMenuItem *)item
+{
+    (void)item;
+    YMExportDatabaseKeys(^(NSString *title, NSString *message) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = title;
+        alert.informativeText = message;
+        [alert addButtonWithTitle:@"确定"];
+        [alert runModal];
+    });
 }
 
 

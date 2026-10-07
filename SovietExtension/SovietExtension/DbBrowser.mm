@@ -24,6 +24,7 @@
 #import "DbBrowser.h"
 #import "KeyExporter.h"
 #import "ZstdDecompress.h"
+#import <AVKit/AVKit.h>
 #import <Cocoa/Cocoa.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <os/log.h>
@@ -589,6 +590,7 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 @property (nonatomic, strong) YMDbBrowserDatabaseItem *database;  // 数据库/表/会话节点
 @property (nonatomic, copy) NSString *tableName;                  // 表/会话节点（Msg_<md5>）
 @property (nonatomic, copy) NSString *tableCount;                 // 表/会话节点
+@property (nonatomic, assign) BOOL tableIsView;                   // 专业模式表节点：是否视图
 @end
 
 @implementation YMDbTreeNode
@@ -617,6 +619,7 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 @property (nonatomic, weak) NSScrollView *previewScroll;
 @property (nonatomic, weak) NSTextView *previewText;
 @property (nonatomic, weak) NSImageView *previewImage;
+@property (nonatomic, weak) AVPlayerView *previewPlayer;
 @property (nonatomic, assign) unsigned long long attachSeed;   // 0 = 未求出
 @property (nonatomic, assign) unsigned char attachXor;
 @property (nonatomic, assign) BOOL attachXorKnown;
@@ -778,6 +781,14 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     previewImage.autoresizingMask = NSViewMinYMargin;
     [previewPane addSubview:previewImage];
     _previewImage = previewImage;
+
+    AVPlayerView *previewPlayer = [[AVPlayerView alloc] init];
+    previewPlayer.controlsStyle = AVPlayerViewControlsStyleFloating;
+    previewPlayer.hidden = YES;
+    previewPlayer.frame = NSMakeRect(0, previewPane.bounds.size.height - 240, kPreviewW, 220);
+    previewPlayer.autoresizingMask = NSViewMinYMargin;
+    [previewPane addSubview:previewPlayer];
+    _previewPlayer = previewPlayer;
 
     NSScrollView *previewScroll = [[NSScrollView alloc] init];
     previewScroll.hasVerticalScroller = YES;
@@ -1162,7 +1173,7 @@ static NSString *ym_local_type_label(NSInteger type)
             error = nil;
             decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error, attempt > 0);
             if (!decrypted) break;
-            result = ym_sqlite_query(decrypted, @"SELECT name FROM sqlite_master "
+            result = ym_sqlite_query(decrypted, @"SELECT name, type FROM sqlite_master "
                 "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name", &error);
             if (!result && attempt == 0 && ym_error_looks_corrupt(error)) {
                 os_log_error(ym_db_browser_log(), "table list corrupt, retry fresh: %{public}@", error);
@@ -1174,6 +1185,7 @@ static NSString *ym_local_type_label(NSInteger type)
             for (NSArray *row in result[@"rows"]) {
                 NSString *name = row.count > 0 ? row[0] : nil;
                 if (![name isKindOfClass:[NSString class]]) continue;
+                BOOL isView = row.count > 1 && [row[1] isEqualToString:@"view"];
                 NSString *countSql = [NSString stringWithFormat:@"SELECT count(*) FROM \"%@\"",
                                       ym_quote_identifier(name)];
                 NSDictionary *counted = ym_sqlite_query(decrypted, countSql, nil);
@@ -1186,6 +1198,7 @@ static NSString *ym_local_type_label(NSInteger type)
                 tableNode.database = item;
                 tableNode.tableName = name;
                 tableNode.tableCount = count;
+                tableNode.tableIsView = isView;
                 [tableNodes addObject:tableNode];
             }
         } else {
@@ -1240,7 +1253,11 @@ static NSString *ym_local_type_label(NSInteger type)
                     @" FROM SessionTable ORDER BY sort_timestamp DESC"
                 stringByAppendingString:page];
         default:
-            return [NSString stringWithFormat:@"SELECT * FROM \"%@\"%@",
+            if (node.tableIsView) {
+                return [NSString stringWithFormat:@"SELECT * FROM \"%@\"%@",
+                        ym_quote_identifier(node.tableName), page];
+            }
+            return [NSString stringWithFormat:@"SELECT rowid AS \"#\", * FROM \"%@\"%@",
                     ym_quote_identifier(node.tableName), page];
     }
 }
@@ -1543,10 +1560,17 @@ static NSString *ym_attach_info_for_row(const void *pi, int piLen,
         const unsigned char *h = (const unsigned char *)decoded.bytes;
         BOOL viewable = (h[0] == 0xFF && h[1] == 0xD8) || (h[0] == 0x89 && h[1] == 0x50) ||
                         (h[0] == 'G' && h[1] == 'I' && h[2] == 'F') ||
-                        (h[0] == 'R' && h[1] == 'I' && h[2] == 'F' && h[3] == 'F');
+                        (h[0] == 'R' && h[1] == 'I' && h[2] == 'F' && h[3] == 'F') ||
+                        (decoded.length > 8 && h[4] == 'f' && h[5] == 't' && h[6] == 'y' && h[7] == 'p');
         if (viewable) return decoded;
     }
     return nil;
+}
+
+static BOOL ym_media_is_video(NSData *data)
+{
+    const unsigned char *h = (const unsigned char *)data.bytes;
+    return data.length > 8 && h[4] == 'f' && h[5] == 't' && h[6] == 'y' && h[7] == 'p';
 }
 
 #pragma mark NSTableViewDataSource / Delegate（行数据）
@@ -1573,11 +1597,15 @@ static NSString *ym_attach_info_for_row(const void *pi, int piLen,
     }
     NSArray<NSString *> *cells = self.rows[row];
 
-    if (self.currentNode.kind == YMDbTreeNodeConversation) {
-        // 会话消息：按行号回查完整内容与 packed_info_data（附件 md5）
-        NSString *title = cells.count > 2 ? cells[2] : @"";
+    BOOL isConversation = self.currentNode.kind == YMDbTreeNodeConversation;
+    // 专业模式的消息表（含 packed_info_data 列）同样走媒体预览
+    BOOL isMessageTable = self.currentNode.kind == YMDbTreeNodeTable &&
+        [self.columns containsObject:@"packed_info_data"] && !self.currentNode.tableIsView;
+    if (isConversation || isMessageTable) {
+        NSString *title = isConversation ? (cells.count > 2 ? cells[2] : @"") : self.currentNode.title;
         self.previewTitle.stringValue = [NSString stringWithFormat:@"%@ · 消息 #%@", title, cells.firstObject ?: @"?"];
-        self.previewText.string = cells.count > 4 ? cells[4] : @"";
+        self.previewText.string = isConversation ? (cells.count > 4 ? cells[4] : @"")
+            : (cells.count > 4 ? cells[4] : @"");
         NSString *localId = cells.firstObject;
         NSString *tableName = self.currentNode.tableName;
         YMDbBrowserDatabaseItem *item = self.currentNode.database;
@@ -1596,7 +1624,9 @@ static NSString *ym_attach_info_for_row(const void *pi, int piLen,
                 if (sqlite3_open_v2(uri.UTF8String, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
                     sqlite3_stmt *stmt = NULL;
                     NSString *blobSql = [NSString stringWithFormat:
-                        @"SELECT packed_info_data, message_content FROM \"%@\" WHERE local_id=%@",
+                        isConversation
+                            ? @"SELECT packed_info_data, message_content FROM \"%@\" WHERE local_id=%@"
+                            : @"SELECT packed_info_data, message_content FROM \"%@\" WHERE rowid=%@",
                         ym_quote_identifier(tableName), localId];
                     if (sqlite3_prepare_v2(db, blobSql.UTF8String, -1, &stmt, NULL) == SQLITE_OK &&
                         sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1614,9 +1644,28 @@ static NSString *ym_attach_info_for_row(const void *pi, int piLen,
                                 self.previewText.string = [attachInfo stringByAppendingString:
                                     [@"\n\n—— 解码内容 ——\n" stringByAppendingString:fullContent]];
                             }
-                            NSImage *image = mediaData ? [[NSImage alloc] initWithData:mediaData] : nil;
-                            self.previewImage.image = image;
-                            self.previewImage.hidden = !image;
+                            self.previewPlayer.hidden = YES;
+                            [self.previewPlayer.player pause];
+                            self.previewPlayer.player = nil;
+                            self.previewImage.image = nil;
+                            self.previewImage.hidden = YES;
+                            if (mediaData) {
+                                if (ym_media_is_video(mediaData)) {
+                                    NSString *videoPath = [ym_db_cache_directory()
+                                        stringByAppendingPathComponent:[NSString stringWithFormat:@"preview_%@.mp4", localId]];
+                                    if ([mediaData writeToFile:videoPath atomically:YES]) {
+                                        self.previewPlayer.player = [AVPlayer playerWithURL:
+                                            [NSURL fileURLWithPath:videoPath]];
+                                        self.previewPlayer.hidden = NO;
+                                    }
+                                } else {
+                                    NSImage *image = [[NSImage alloc] initWithData:mediaData];
+                                    if (image) {
+                                        self.previewImage.image = image;
+                                        self.previewImage.hidden = NO;
+                                    }
+                                }
+                            }
                         });
                     }
                     if (stmt) sqlite3_finalize(stmt);

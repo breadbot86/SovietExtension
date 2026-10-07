@@ -188,6 +188,10 @@
 					"-framework",
 					UniformTypeIdentifiers,
 					"-lsqlite3",
+					"-framework",
+					AVKit,
+					"-framework",
+					AVFoundation,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.mustangym.SovietExtension;
 				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";
@@ -229,6 +233,10 @@
 					"-framework",
 					UniformTypeIdentifiers,
 					"-lsqlite3",
+					"-framework",
+					AVKit,
+					"-framework",
+					AVFoundation,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.mustangym.SovietExtension;
 				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";

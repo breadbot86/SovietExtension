@@ -373,7 +373,7 @@ static NSData *ym_v2_decode(NSData *data, const unsigned char keyAscii[16], unsi
 
     unsigned char *aesOut = (unsigned char *)malloc(alignedFull);
     size_t moved = 0;
-    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0, keyAscii, 16, NULL,
+    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode, keyAscii, 16, NULL,
                                  bytes + 15, alignedFull, aesOut, alignedFull, &moved);
     if (st != kCCSuccess || moved != alignedFull) { free(aesOut); return nil; }
     uint32_t plainLen = alignedFull;
@@ -412,7 +412,7 @@ static BOOL ym_v2_key_checks(const unsigned char keyAscii[16],
     if ((uint64_t)15 + aligned > n) return NO;
     unsigned char first[16], last[16];
     size_t moved = 0;
-    if (CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0, keyAscii, 16, NULL, data + 15, 16, first, 16, &moved) != kCCSuccess) return NO;
+    if (CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode, keyAscii, 16, NULL, data + 15, 16, first, 16, &moved) != kCCSuccess) return NO;
     BOOL magic = (first[0] == 0xFF && first[1] == 0xD8 && first[2] == 0xFF) ||
                  (first[0] == 0x89 && first[1] == 0x50 && first[2] == 0x4E && first[3] == 0x47) ||
                  (first[0] == 'G' && first[1] == 'I' && first[2] == 'F') ||
@@ -421,7 +421,7 @@ static BOOL ym_v2_key_checks(const unsigned char keyAscii[16],
                  (first[0] == 0x00 && first[1] == 0x00 && first[2] == 0x00 && (first[3] >= 0x14));
     if (!magic) return NO;
     if (xorSize == 0) {
-        if (CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0, keyAscii, 16, NULL, data + 15 + aligned - 16, 16, last, 16, &moved) != kCCSuccess) return NO;
+        if (CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode, keyAscii, 16, NULL, data + 15 + aligned - 16, 16, last, 16, &moved) != kCCSuccess) return NO;
         unsigned char pad = last[15];
         if (pad < 1 || pad > 16) return NO;
         for (unsigned i = 16 - pad; i < 16; i++) if (last[i] != pad) return NO;

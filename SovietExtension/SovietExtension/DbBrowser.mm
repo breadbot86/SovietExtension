@@ -23,6 +23,7 @@
 
 #import "DbBrowser.h"
 #import "KeyExporter.h"
+#import "ZstdDecompress.h"
 #import <Cocoa/Cocoa.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <os/log.h>
@@ -208,6 +209,8 @@ static NSString *ym_decrypt_database(NSString *dbPath, NSString *keyHex, NSStrin
 
 #pragma mark - sqlite 读取
 
+static NSString *ym_text_from_bytes(const void *bytes, int length);
+
 // 只读查询；返回 @{columns: NSArray<NSString*>, rows: NSArray<NSArray<NSString*>*>}
 // 解密副本从源库继承 WAL 模式文件头（0x12/0x13 处 02 02），只读连接首次访问
 // 需建 -shm 会被拒（SQLITE_CANTOPEN "unable to open database file"）。
@@ -249,15 +252,25 @@ static NSDictionary *ym_sqlite_query(NSString *databasePath, NSString *sql, NSSt
                     break;
                 case SQLITE_TEXT: {
                     const unsigned char *text = sqlite3_column_text(stmt, c);
-                    cell = text ? [NSString stringWithUTF8String:(const char *)text] : @"";
+                    cell = text ? [NSString stringWithUTF8String:(const char *)text] : nil;
+                    if (!cell) {
+                        // 无效 UTF-8：可能是 zstd 压缩或加密内容，尝试解码
+                        const void *raw = sqlite3_column_blob(stmt, c);
+                        cell = ym_text_from_bytes(raw, sqlite3_column_bytes(stmt, c));
+                    }
                     if (cell.length > 2000) {
                         cell = [[cell substringToIndex:2000] stringByAppendingString:@"…"];
                     }
                     break;
                 }
                 case SQLITE_BLOB: {
+                    const void *raw = sqlite3_column_blob(stmt, c);
                     int bytes = sqlite3_column_bytes(stmt, c);
-                    cell = [NSString stringWithFormat:@"<BLOB %d B>", bytes];
+                    cell = ym_text_from_bytes(raw, bytes);
+                    if (cell.length > 2000) {
+                        cell = [[cell substringToIndex:2000] stringByAppendingString:@"…"];
+                    }
+                    if (!cell) cell = [NSString stringWithFormat:@"<BLOB %d B>", bytes];
                     break;
                 }
                 default:
@@ -272,6 +285,32 @@ static NSDictionary *ym_sqlite_query(NSString *databasePath, NSString *sql, NSSt
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     return @{ @"columns": columns, @"rows": rows };
+}
+
+// 把（可能是 zstd 压缩或二进制的）字节转成可读文本；无法解读返回 nil。
+static NSString *ym_text_from_bytes(const void *bytes, int length)
+{
+    if (!bytes || length <= 0) return nil;
+    NSData *zstd = YMZstdDecompress([NSData dataWithBytes:bytes length:length], 4 * 1024 * 1024);
+    if (zstd) {
+        NSString *decoded = [[NSString alloc] initWithData:zstd encoding:NSUTF8StringEncoding];
+        if (decoded) return decoded;
+    }
+    // 能完整按 UTF-8 解码且不含控制字符（制表/换行/回车除外）即视为文本
+    NSString *plain = [[NSString alloc] initWithBytes:bytes length:length encoding:NSUTF8StringEncoding];
+    if (plain) {
+        static unichar allowed[] = {'\t', '\n', '\r'};
+        for (NSUInteger i = 0; i < plain.length; i++) {
+            unichar ch = [plain characterAtIndex:i];
+            if (ch < 0x20 || ch == 0x7F) {
+                BOOL ok = NO;
+                for (NSUInteger j = 0; j < 3; j++) if (ch == allowed[j]) ok = YES;
+                if (!ok) return nil;
+            }
+        }
+        return plain;
+    }
+    return nil;
 }
 
 static NSString *ym_quote_identifier(NSString *identifier)
@@ -386,6 +425,9 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 @property (nonatomic, weak) NSButton *loadMoreButton;
 @property (nonatomic, weak) NSTextField *statusField;
 @property (nonatomic, weak) NSSegmentedControl *modeControl;
+@property (nonatomic, weak) NSTextField *previewTitle;
+@property (nonatomic, weak) NSScrollView *previewScroll;
+@property (nonatomic, weak) NSTextView *previewText;
 @property (nonatomic, assign) BOOL simpleMode;                      // YES=简易模式
 @property (nonatomic, strong) NSDictionary<NSString *, NSString *> *contactNames;  // username → 显示名
 @property (nonatomic, copy) NSString *selfUsername;
@@ -530,9 +572,45 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
         [loadMore.heightAnchor constraintEqualToConstant:24],
     ]];
 
+    // 预览面板：选中行显示完整解码内容与媒体文件信息
+    NSView *previewPane = [[NSView alloc] init];
+    previewPane.translatesAutoresizingMaskIntoConstraints = NO;
+    NSTextField *previewTitle = [NSTextField labelWithString:@"预览"];
+    previewTitle.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    previewTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    [previewPane addSubview:previewTitle];
+    NSScrollView *previewScroll = [[NSScrollView alloc] init];
+    previewScroll.translatesAutoresizingMaskIntoConstraints = NO;
+    previewScroll.hasVerticalScroller = YES;
+    previewScroll.hasHorizontalScroller = YES;
+    previewScroll.autohidesScrollers = YES;
+    previewScroll.borderType = NSBezelBorder;
+    NSTextView *previewText = [[NSTextView alloc] initWithFrame:NSZeroRect];
+    previewText.editable = NO;
+    previewText.selectable = YES;
+    previewText.richText = NO;
+    previewText.font = [NSFont fontWithName:@"Menlo" size:11] ?: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    previewText.backgroundColor = [NSColor textBackgroundColor];
+    previewScroll.documentView = previewText;
+    [previewPane addSubview:previewScroll];
+    [NSLayoutConstraint activateConstraints:@[
+        [previewTitle.topAnchor constraintEqualToAnchor:previewPane.topAnchor],
+        [previewTitle.leadingAnchor constraintEqualToAnchor:previewPane.leadingAnchor constant:4],
+        [previewTitle.heightAnchor constraintEqualToConstant:20],
+        [previewScroll.topAnchor constraintEqualToAnchor:previewTitle.bottomAnchor constant:2],
+        [previewScroll.leadingAnchor constraintEqualToAnchor:previewPane.leadingAnchor],
+        [previewScroll.trailingAnchor constraintEqualToAnchor:previewPane.trailingAnchor],
+        [previewScroll.bottomAnchor constraintEqualToAnchor:previewPane.bottomAnchor],
+    ]];
+    _previewTitle = previewTitle;
+    _previewScroll = previewScroll;
+    _previewText = previewText;
+
     [split addArrangedSubview:treeScroll];
     [split addArrangedSubview:rowsPane];
+    [split addArrangedSubview:previewPane];
     [split setPosition:320 ofDividerAtIndex:0];
+    [split setPosition:700 ofDividerAtIndex:1];
 }
 
 - (void)showWindowCentered
@@ -941,8 +1019,9 @@ static NSString *ym_local_type_label(NSInteger type)
     switch (node.kind) {
         case YMDbTreeNodeConversation:
             return [[NSString stringWithFormat:
-                @"SELECT m.create_time AS 时间, COALESCE(n.user_name, CAST(m.real_sender_id AS TEXT)) AS 发送者,"
-                @" m.local_type AS 类型, m.message_content AS 内容"
+                @"SELECT m.local_id AS \"#\", m.create_time AS 时间,"
+                @" COALESCE(n.user_name, CAST(m.real_sender_id AS TEXT)) AS 发送者,"
+                @" m.local_type AS 类型, CAST(m.message_content AS BLOB) AS 内容"
                 @" FROM \"%@\" m LEFT JOIN Name2Id n ON m.real_sender_id = n.rowid"
                 @" ORDER BY m.sort_seq DESC", ym_quote_identifier(node.tableName)]
                 stringByAppendingString:page];
@@ -969,14 +1048,14 @@ static NSString *ym_local_type_label(NSInteger type)
         for (NSUInteger i = 0; i < row.count; i++) {
             NSString *cell = row[i];
             if ([cell isKindOfClass:[NSString class]]) {
-                if (i == 0 && cell.length > 0 && [cell longLongValue] > 0) {
+                if (i == 1 && cell.length > 0 && [cell longLongValue] > 0) {
                     cell = ym_format_timestamp([cell longLongValue]);
-                } else if (i == 1 && cell.length > 0) {
+                } else if (i == 2 && cell.length > 0) {
                     NSString *username = cell;
                     NSString *display = ym_contact_display(username, self.contactNames);
                     if ([username isEqualToString:self.selfUsername]) display = @"我";
                     cell = display;
-                } else if (i == 2 && cell.length > 0) {
+                } else if (i == 3 && cell.length > 0) {
                     cell = ym_local_type_label([cell integerValue]);
                 }
             }
@@ -1168,11 +1247,132 @@ static NSString *ym_local_type_label(NSInteger type)
     }
 }
 
+static NSString *ym_attach_info_for_row(const void *pi, int piLen,
+                                        const void *mc, int mcLen,
+                                        YMDbTreeNode *conversationNode);
+
 #pragma mark NSTableViewDataSource / Delegate（行数据）
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
 {
     return self.rows.count;
+}
+
+- (void)tableViewSelectionDidChange:(NSNotification *)notification
+{
+    if (notification.object != self.rowsTable) return;
+    [self ym_updatePreviewForSelectedRow];
+}
+
+// 选中行 → 右侧预览：完整解码内容 + 媒体文件信息
+- (void)ym_updatePreviewForSelectedRow
+{
+    NSInteger row = self.rowsTable.selectedRow;
+    if (row < 0 || row >= (NSInteger)self.rows.count) {
+        self.previewTitle.stringValue = @"预览";
+        self.previewText.string = @"";
+        return;
+    }
+    NSArray<NSString *> *cells = self.rows[row];
+
+    if (self.currentNode.kind == YMDbTreeNodeConversation) {
+        // 会话消息：按行号回查完整内容与 packed_info_data（附件 md5）
+        NSString *title = cells.count > 2 ? cells[2] : @"";
+        self.previewTitle.stringValue = [NSString stringWithFormat:@"%@ · 消息 #%@", title, cells.firstObject ?: @"?"];
+        self.previewText.string = cells.count > 4 ? cells[4] : @"";
+        NSString *localId = cells.firstObject;
+        NSString *tableName = self.currentNode.tableName;
+        YMDbBrowserDatabaseItem *item = self.currentNode.database;
+        if (localId.length > 0 && tableName && item) {
+            dispatch_async(self.workQueue, ^{
+                NSString *error = nil;
+                NSString *decrypted = ym_decrypt_database(item.absolutePath, item.keyHex, &error, NO);
+                if (!decrypted) return;
+                NSString *sql = [NSString stringWithFormat:
+                    @"SELECT packed_info_data FROM \"%@\" WHERE local_id=%@",
+                    ym_quote_identifier(tableName), localId];
+                // 单元格已文本化，这里用原始查询拿 blob 与完整内容
+                (void)sql;
+                sqlite3 *db = NULL;
+                NSString *uri = [NSString stringWithFormat:@"file://%@?immutable=1", decrypted];
+                if (sqlite3_open_v2(uri.UTF8String, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
+                    sqlite3_stmt *stmt = NULL;
+                    NSString *blobSql = [NSString stringWithFormat:
+                        @"SELECT packed_info_data, message_content FROM \"%@\" WHERE local_id=%@",
+                        ym_quote_identifier(tableName), localId];
+                    if (sqlite3_prepare_v2(db, blobSql.UTF8String, -1, &stmt, NULL) == SQLITE_OK &&
+                        sqlite3_step(stmt) == SQLITE_ROW) {
+                        const void *pi = sqlite3_column_blob(stmt, 0);
+                        int piLen = sqlite3_column_bytes(stmt, 0);
+                        const void *mc = sqlite3_column_blob(stmt, 1);
+                        int mcLen = sqlite3_column_bytes(stmt, 1);
+                        NSString *fullContent = ym_text_from_bytes(mc, mcLen) ?: @"";
+                        NSString *attachInfo = ym_attach_info_for_row(pi, piLen, mc, mcLen, self.currentNode);
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            self.previewText.string = fullContent.length > 0 ? fullContent : @"（无文本内容）";
+                            if (attachInfo.length > 0) {
+                                self.previewText.string = [attachInfo stringByAppendingString:
+                                    [@"\n\n—— 解码内容 ——\n" stringByAppendingString:fullContent]];
+                            }
+                        });
+                    }
+                    if (stmt) sqlite3_finalize(stmt);
+                    sqlite3_close(db);
+                }
+            });
+        }
+    } else {
+        // 其他视图：拼接全部列
+        NSMutableString *text = [NSMutableString string];
+        for (NSUInteger i = 0; i < self.columns.count && i < cells.count; i++) {
+            [text appendFormat:@"%@: %@\n", self.columns[i], cells[i]];
+        }
+        self.previewTitle.stringValue = @"预览";
+        self.previewText.string = text;
+    }
+}
+
+// 依据 packed_info_data 的附件 md5 与消息时间定位 msg/attach 下的文件
+static NSString *ym_attach_info_for_row(const void *pi, int piLen,
+                                        const void *mc, int mcLen,
+                                        YMDbTreeNode *conversationNode)
+{
+    if (!pi || piLen <= 0 || !conversationNode.database) return @"";
+    NSData *piData = [NSData dataWithBytes:pi length:piLen];
+    NSString *piText = [[NSString alloc] initWithData:piData encoding:NSASCIIStringEncoding];
+    if (!piText) return @"";
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[0-9a-f]{32}" options:0 error:nil];
+    NSTextCheckingResult *match = [re firstMatchInString:piText options:0 range:NSMakeRange(0, piText.length)];
+    if (!match) return @"";
+    NSString *attachMd5 = [piText substringWithRange:match.range];
+    NSString *convMd5 = [conversationNode.tableName substringFromIndex:4];
+
+    NSString *account = conversationNode.database.account;
+    NSString *root = ym_xwechat_files_root();
+    if (!root) return @"";
+    NSString *attachRoot = [[[root stringByAppendingPathComponent:account]
+        stringByAppendingPathComponent:@"msg"] stringByAppendingPathComponent:@"attach"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *found = [NSMutableArray array];
+    NSArray *types = @[@"Img", @"Video", @"File", @"Emoji"];
+    for (NSString *type in types) {
+        NSDirectoryEnumerator *e = [fm enumeratorAtURL:[NSURL fileURLWithPath:
+            [attachRoot stringByAppendingPathComponent:convMd5]]
+            includingPropertiesForKeys:nil options:0 errorHandler:nil];
+        for (NSURL *url in e) {
+            NSString *name = url.lastPathComponent;
+            if (![name hasPrefix:attachMd5]) continue;
+            NSString *dir = url.path.stringByDeletingLastPathComponent;
+            if (![dir containsString:[@"/" stringByAppendingString:type]]) continue;
+            NSDictionary *attrs = [fm attributesOfItemAtPath:url.path error:nil];
+            [found addObject:[NSString stringWithFormat:@"%@\n  %@（%llu B）",
+                type, url.path, [attrs fileSize]]];
+        }
+    }
+    if (found.count == 0) return @"";
+    return [NSString stringWithFormat:@"附件：%@\n（文件为微信加密格式 .dat，图像预览需后续版本）",
+        [found componentsJoinedByString:@"\n"]];
 }
 
 - (id)tableView:(NSTableView *)tableView objectValueForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row

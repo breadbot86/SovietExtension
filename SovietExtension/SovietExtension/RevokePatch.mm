@@ -4864,7 +4864,15 @@ static BOOL YMPatchRevokeLocalCallsiteOnly(uintptr_t slide, NSString *source) {
     }
 
     const BOOL nativeSelf = YMSelfRevokeSupportedBuild(profile);
-    if (nativeSelf) return YMInstallSelfRevokePatch();
+    if (nativeSelf) {
+        // SelfRevoke 的 siteOrigin stub 复用 YMRevokeOriginCallsiteHelper；提前 return
+        // 跳过了下面对全局槽位的赋值，270102 会落回 269079 的 0x18/0x2C0 旧栈槽，
+        // helper 读到的 outWrap/ext 全是栈垃圾（own 判定失败、svrId=0、session 空），
+        // 他人与本人防撤回均失效。
+        YMRevokeOriginOutWrapStackOffset = profile->revokeOriginOutWrapStackOffset != 0 ? profile->revokeOriginOutWrapStackOffset : 0x18;
+        YMRevokeOriginExtObjectStackOffset = profile->revokeOriginExtObjectStackOffset != 0 ? profile->revokeOriginExtObjectStackOffset : 0x2C0;
+        return YMInstallSelfRevokePatch();
+    }
 
     uintptr_t callsite = slide + profile->revokeOriginCallsiteAfterQueryVA;
 

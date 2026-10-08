@@ -7,5 +7,6 @@ __pycache__/
 
 # 本地逆向资料，勿上传
 /scripts/
+/tools/
 /微信小程序解包方法论.md
 .DS_Store

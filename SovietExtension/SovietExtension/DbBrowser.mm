@@ -608,7 +608,8 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 #pragma mark - wxapkg 解包（第 1 层容器解密，算法与 scripts/01_decrypt_wxapkg.py 一致）
 
 // V1MMWX：PBKDF2-SHA1(appid, "saltiest", 1000, 32) + AES-256-CBC 固定 IV 解头部
-// 1024B 取前 1023，其余与 appid 逐字节循环 XOR。无 V1MMWX 头则视为明文包。
+// 1024B 取前 1023；尾部与 appid[16]（第 17 个字符）单字节循环 XOR。
+// （实测 5/5 包验证；旧「appid 整串循环」仅对小包头区碰巧成立。）
 static NSData *ym_wxapkg_decrypt(NSData *data, NSString *appid)
 {
     const unsigned char *bytes = (const unsigned char *)data.bytes;
@@ -629,12 +630,12 @@ static NSData *ym_wxapkg_decrypt(NSData *data, NSString *appid)
     }
     NSMutableData *plain = [NSMutableData dataWithCapacity:data.length];
     [plain appendBytes:head length:1023];
-    const unsigned char *xk = (const unsigned char *)pwd;
-    size_t xkLen = strlen(pwd);
-    if (xkLen == 0) return nil;
+    size_t pwdLen = strlen(pwd);
+    if (pwdLen == 0 || pwdLen < 17) return nil;
+    unsigned char xk = (unsigned char)pwd[16];  // appid[16]
     unsigned char *body = (unsigned char *)malloc(data.length - 1030);
     for (size_t i = 1030; i < data.length; i++) {
-        body[i - 1030] = bytes[i] ^ xk[(i - 1030) % xkLen];
+        body[i - 1030] = bytes[i] ^ xk;
     }
     [plain appendBytes:body length:data.length - 1030];
     free(body);

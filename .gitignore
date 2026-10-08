@@ -10,3 +10,4 @@ __pycache__/
 /tools/
 /微信小程序解包方法论.md
 .DS_Store
+.zcodeignore

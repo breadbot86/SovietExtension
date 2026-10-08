@@ -4,3 +4,8 @@ Test/
 /tests/
 __pycache__/
 *.pyc
+
+# 本地逆向资料，勿上传
+/scripts/
+/微信小程序解包方法论.md
+.DS_Store

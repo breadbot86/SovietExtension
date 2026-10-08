@@ -605,6 +605,116 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 }
 @end
 
+#pragma mark - wxapkg 解包（第 1 层容器解密，算法与 scripts/01_decrypt_wxapkg.py 一致）
+
+// V1MMWX：PBKDF2-SHA1(appid, "saltiest", 1000, 32) + AES-256-CBC 固定 IV 解头部
+// 1024B 取前 1023，其余与 appid 逐字节循环 XOR。无 V1MMWX 头则视为明文包。
+static NSData *ym_wxapkg_decrypt(NSData *data, NSString *appid)
+{
+    const unsigned char *bytes = (const unsigned char *)data.bytes;
+    if (data.length < 1030 + 16 || memcmp(bytes, "V1MMWX", 6) != 0) {
+        return (data.length > 18 && bytes[0] == 0xBE) ? data : nil;  // 已是明文
+    }
+    const char *pwd = appid.UTF8String;
+    unsigned char key[32];
+    CCKeyDerivationPBKDF(kCCPBKDF2, pwd, (size_t)strlen(pwd),
+                         (const unsigned char *)"saltiest", 8,
+                         kCCPRFHmacAlgSHA1, 1000, key, 32);
+    unsigned char head[1024];
+    size_t moved = 0;
+    if (CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0, key, 32,
+                "the iv: 16 bytes", bytes + 6, 1024, head, 1024, &moved) != kCCSuccess ||
+        moved != 1024) {
+        return nil;
+    }
+    NSMutableData *plain = [NSMutableData dataWithCapacity:data.length];
+    [plain appendBytes:head length:1023];
+    const unsigned char *xk = (const unsigned char *)pwd;
+    size_t xkLen = strlen(pwd);
+    if (xkLen == 0) return nil;
+    unsigned char *body = (unsigned char *)malloc(data.length - 1030);
+    for (size_t i = 1030; i < data.length; i++) {
+        body[i - 1030] = bytes[i] ^ xk[(i - 1030) % xkLen];
+    }
+    [plain appendBytes:body length:data.length - 1030];
+    free(body);
+    const unsigned char *p = (const unsigned char *)plain.bytes;
+    if (p[0] != 0xBE || p[13] != 0xED) return nil;  // appid 不对
+    return plain;
+}
+
+// 经典明文 wxapkg 按索引拆文件树；返回文件数，失败返回 -1。
+// outPartial：主包索引超出 1023B AES 头区时尾部加密未破解，只解出可验证条目。
+static long ym_wxapkg_unpack(NSData *plain, NSString *outdir, NSString **outError,
+                             NSString **outPartial)
+{
+    const unsigned char *p = (const unsigned char *)plain.bytes;
+    if (plain.length < 18 || p[0] != 0xBE || p[13] != 0xED) {
+        if (outError) *outError = @"不是有效的 wxapkg（头校验失败）";
+        return -1;
+    }
+    uint32_t idxLen = ym_be32(p + 5);
+    uint32_t count = ym_be32(p + 14);
+    size_t pos = 18;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:outdir withIntermediateDirectories:YES attributes:nil error:nil];
+    long written = 0;
+    uint32_t parsed = 0;
+    BOOL truncated = NO;
+    for (uint32_t i = 0; i < count; i++) {
+        // 名字须为合法 UTF-8 且路径不逃逸，否则视为越过已解密区域
+        if (pos + 4 > plain.length) { truncated = YES; break; }
+        uint32_t probe = ym_be32(p + pos);
+        if (probe == 0 || probe > 512) { truncated = YES; break; }
+        if (![[NSString alloc] initWithBytes:p + pos + 4 length:probe
+                                    encoding:NSUTF8StringEncoding]) {
+            truncated = YES; break;
+        }
+        parsed++;
+        if (pos + 4 > plain.length) break;
+        uint32_t nameLen = ym_be32(p + pos); pos += 4;
+        if (pos + nameLen + 8 > plain.length) break;
+        NSString *name = [[NSString alloc] initWithBytes:p + pos length:nameLen
+                                                encoding:NSUTF8StringEncoding];
+        pos += nameLen;
+        uint32_t offset = ym_be32(p + pos); pos += 4;
+        uint32_t size = ym_be32(p + pos); pos += 4;
+        if (!name.length || name.length > 1024 || (size_t)offset + size > plain.length) continue;
+        if ([name hasPrefix:@".."] || [name containsString:@"../"]) continue;  // 防路径逃逸
+        NSString *filePath = [outdir stringByAppendingPathComponent:name];
+        [fm createDirectoryAtPath:[filePath stringByDeletingLastPathComponent]
+              withIntermediateDirectories:YES attributes:nil error:nil];
+        NSData *chunk = [NSData dataWithBytesNoCopy:(void *)(p + offset) length:size freeWhenDone:NO];
+        if ([chunk writeToFile:filePath atomically:YES]) written++;
+    }
+    (void)idxLen;
+    if (truncated && outPartial) {
+        *outPartial = [NSString stringWithFormat:
+            @"索引声明 %u 条，仅前 %u 条位于已解密头区（大包尾部容器加密未破解，见《微信小程序解包方法论》§2）",
+            count, parsed];
+    }
+    return written;
+}
+
+// appid → applet/packages/<appid> 目录（遍历 radium/users/*）
+static NSString *ym_wxapkg_package_dir(NSString *appid)
+{
+    if (![appid hasPrefix:@"wx"]) return nil;
+    NSString *root = ym_xwechat_files_root();
+    if (!root) return nil;
+    NSString *users = [[[[root stringByDeletingLastPathComponent]
+        stringByAppendingPathComponent:@"app_data"] stringByAppendingPathComponent:@"radium"]
+        stringByAppendingPathComponent:@"users"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *user in [fm contentsOfDirectoryAtPath:users error:nil]) {
+        NSString *candidate = [[[[users stringByAppendingPathComponent:user]
+            stringByAppendingPathComponent:@"applet"] stringByAppendingPathComponent:@"packages"]
+            stringByAppendingPathComponent:appid];
+        if ([fm fileExistsAtPath:candidate isDirectory:NULL]) return candidate;
+    }
+    return nil;
+}
+
 #pragma mark - 浏览器窗口
 
 @interface DbBrowserWindowController : NSWindowController <NSOutlineViewDataSource, NSOutlineViewDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate>
@@ -621,6 +731,10 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
 @property (nonatomic, weak) NSTextView *previewText;
 @property (nonatomic, weak) NSImageView *previewImage;
 @property (nonatomic, weak) AVPlayerView *previewPlayer;
+@property (nonatomic, weak) NSView *miniBar;
+@property (nonatomic, weak) NSTextField *miniPathField;
+@property (nonatomic, strong) NSString *currentMiniAppId;
+@property (nonatomic, strong) NSString *currentMiniName;
 @property (nonatomic, assign) unsigned long long attachSeed;   // 0 = 未求出
 @property (nonatomic, assign) unsigned char attachXor;
 @property (nonatomic, assign) BOOL attachXorKnown;
@@ -790,6 +904,42 @@ typedef NS_ENUM(NSInteger, YMDbTreeNodeKind) {
     previewPlayer.autoresizingMask = NSViewMinYMargin;
     [previewPane addSubview:previewPlayer];
     _previewPlayer = previewPlayer;
+
+    // 小程序行专用操作栏：路径 + 打开 + 解包
+    NSView *miniBar = [[NSView alloc] init];
+    miniBar.hidden = YES;
+    miniBar.frame = NSMakeRect(0, previewPane.bounds.size.height - 240, kPreviewW, 220);
+    miniBar.autoresizingMask = NSViewMinYMargin;
+    [previewPane addSubview:miniBar];
+    _miniBar = miniBar;
+
+    NSButton *openBtn = [NSButton buttonWithTitle:@"打开目录"
+                                            target:self action:@selector(ym_openMiniPackageDir:)];
+    openBtn.bezelStyle = NSBezelStyleRounded;
+    openBtn.controlSize = NSControlSizeSmall;
+    openBtn.font = [NSFont systemFontOfSize:11];
+    openBtn.frame = NSMakeRect(4, 180, 88, 24);
+    openBtn.autoresizingMask = NSViewMinYMargin;
+    [miniBar addSubview:openBtn];
+
+    NSButton *unpackBtn = [NSButton buttonWithTitle:@"解包 wxapkg"
+                                              target:self action:@selector(ym_unpackMiniPackage:)];
+    unpackBtn.bezelStyle = NSBezelStyleRounded;
+    unpackBtn.controlSize = NSControlSizeSmall;
+    unpackBtn.font = [NSFont systemFontOfSize:11];
+    unpackBtn.frame = NSMakeRect(96, 180, 110, 24);
+    unpackBtn.autoresizingMask = NSViewMinYMargin;
+    [miniBar addSubview:unpackBtn];
+
+    NSTextField *miniPath = [NSTextField labelWithString:@"（未找到本地包）"];
+    miniPath.font = [NSFont systemFontOfSize:10];
+    miniPath.textColor = [NSColor secondaryLabelColor];
+    miniPath.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    miniPath.selectable = YES;
+    miniPath.frame = NSMakeRect(4, 158, kPreviewW - 8, 16);
+    miniPath.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable;
+    [miniBar addSubview:miniPath];
+    _miniPathField = miniPath;
 
     NSScrollView *previewScroll = [[NSScrollView alloc] init];
     previewScroll.hasVerticalScroller = YES;
@@ -1742,6 +1892,84 @@ static BOOL ym_media_is_video(NSData *data)
     [self ym_updatePreviewForSelectedRow];
 }
 
+#pragma mark 小程序预览操作
+
+- (void)ym_openMiniPackageDir:(NSButton *)sender
+{
+    (void)sender;
+    NSString *dir = ym_wxapkg_package_dir(self.currentMiniAppId ?: @"");
+    if (!dir) {
+        self.statusField.stringValue = @"未找到本地包缓存（该小程序可能未在本机打开过）";
+        return;
+    }
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:dir]];
+}
+
+- (void)ym_unpackMiniPackage:(NSButton *)sender
+{
+    (void)sender;
+    NSString *appid = self.currentMiniAppId;
+    NSString *name = self.currentMiniName ?: (appid ?: @"");
+    NSString *pkgDir = ym_wxapkg_package_dir(appid ?: @"");
+    if (!pkgDir) {
+        self.statusField.stringValue = @"未找到本地包缓存，无法解包（先在本机打开一次该小程序）";
+        return;
+    }
+    self.statusField.stringValue = [NSString stringWithFormat:@"正在解包 %@ …", name];
+    dispatch_async(self.workQueue, ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *outRoot = [[NSHomeDirectory() stringByAppendingPathComponent:@"Downloads"]
+            stringByAppendingPathComponent:[@"wxapkg" stringByAppendingPathComponent:(appid ?: @"unknown")]];
+        long totalFiles = 0, packCount = 0;
+        long partialNotes = 0;
+        NSString *firstError = nil;
+        // packages/<目录appid>/<版本>/*.wxapkg —— 密码 = 目录本身的 appid（插件包亦然）
+        for (NSString *version in [fm contentsOfDirectoryAtPath:pkgDir error:nil]) {
+            NSString *versionDir = [pkgDir stringByAppendingPathComponent:version];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:versionDir isDirectory:&isDir] || !isDir) continue;
+            for (NSString *file in [fm contentsOfDirectoryAtPath:versionDir error:nil]) {
+                if (![file.lowercaseString hasSuffix:@".wxapkg"]) continue;
+                NSString *wxapkgPath = [versionDir stringByAppendingPathComponent:file];
+                NSData *raw = [NSData dataWithContentsOfFile:wxapkgPath];
+                NSData *plain = ym_wxapkg_decrypt(raw, appid);
+                if (!plain) {
+                    firstError = firstError ?: [NSString stringWithFormat:@"%@ 解密失败（appid 不匹配）", file];
+                    continue;
+                }
+                NSString *outDir = [outRoot stringByAppendingPathComponent:
+                    [version stringByAppendingPathComponent:[file stringByDeletingPathExtension]]];
+                NSString *error = nil;
+                NSString *partial = nil;
+                long files = ym_wxapkg_unpack(plain, outDir, &error, &partial);
+                if (files >= 0) {
+                    totalFiles += files;
+                    packCount++;
+                    if (partial) {
+                        [partial writeToFile:[outDir stringByAppendingPathComponent:@"部分解包说明.txt"]
+                                   atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                        partialNotes++;
+                    }
+                } else {
+                    firstError = firstError ?: error;
+                }
+            }
+        }
+        NSString *finalRoot = outRoot;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (packCount > 0) {
+                self.statusField.stringValue = [NSString stringWithFormat:
+                    @"解包完成：%ld 个包、%lu 个文件%@ → %@", (long)packCount, (unsigned long)totalFiles,
+                    partialNotes > 0 ? [NSString stringWithFormat:@"（%ld 个大包为部分解包，见输出目录说明）", partialNotes] : @"",
+                    finalRoot.lastPathComponent];
+                [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:finalRoot]];
+            } else {
+                self.statusField.stringValue = firstError ?: @"解包失败";
+            }
+        });
+    });
+}
+
 // 选中行 → 右侧预览：完整解码内容 + 媒体文件信息
 - (void)ym_updatePreviewForSelectedRow
 {
@@ -1749,9 +1977,23 @@ static BOOL ym_media_is_video(NSData *data)
     if (row < 0 || row >= (NSInteger)self.rows.count) {
         self.previewTitle.stringValue = @"预览";
         self.previewText.string = @"";
+        self.miniBar.hidden = YES;
         return;
     }
     NSArray<NSString *> *cells = self.rows[row];
+
+    // 小程序行：显示路径与操作按钮
+    self.miniBar.hidden = self.currentNode.kind != YMDbTreeNodeMiniPrograms;
+    if (self.currentNode.kind == YMDbTreeNodeMiniPrograms && cells.count >= 3) {
+        self.currentMiniAppId = cells[2];
+        self.currentMiniName = cells[0];
+        self.previewTitle.stringValue = [NSString stringWithFormat:@"小程序 · %@", cells.count > 0 ? cells[0] : @""];
+        NSString *dir = ym_wxapkg_package_dir(cells[2]);
+        self.miniPathField.stringValue = dir ?: @"未找到本地包缓存（先在本机打开一次该小程序）";
+    } else {
+        self.currentMiniAppId = nil;
+        self.currentMiniName = nil;
+    }
 
     BOOL isConversation = self.currentNode.kind == YMDbTreeNodeConversation;
     // 专业模式的消息表（含 packed_info_data 列）同样走媒体预览
